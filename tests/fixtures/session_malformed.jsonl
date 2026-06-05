@@ -1,0 +1,7 @@
+{"type":"system","sessionId":"mal001","cwd":"/home/user/proj"}
+this is not json at all {{{
+{"type":"assistant","timestamp":"2024-01-15T10:10:00.000Z","sessionId":"mal001","message":{"role":"assistant","model":"claude-opus-4-5","content":[{"type":"tool_use","id":"toolu_m01","name":"Write","input":{"file_path":"/tmp/good.py","content":"good content"}}]}}
+{"incomplete": true
+{"type":"assistant","timestamp":"2024-01-15T10:10:01.000Z","sessionId":"mal001","message":{"role":"assistant","model":"claude-opus-4-5","content":"not a list, just a string"}}
+{"type":"assistant","timestamp":"2024-01-15T10:10:02.000Z","sessionId":"mal001","message":"not a dict"}
+{"type":"assistant","timestamp":"2024-01-15T10:10:03.000Z","sessionId":"mal001","message":{"role":"assistant","model":"claude-opus-4-5","content":[{"type":"tool_use","id":"toolu_m02","name":"Write","input":{"file_path":"/tmp/also_good.py","content":"also good"}}]}}
