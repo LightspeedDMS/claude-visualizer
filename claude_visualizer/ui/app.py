@@ -94,21 +94,25 @@ class VisualizerApp(App):
         layout: horizontal;
         height: 1fr;
         overflow: hidden hidden;
+        background: transparent;
     }
     #mru-panel {
         width: 40;
         height: 100%;
         padding: 0 1;
+        background: transparent;
     }
     #top-right {
         width: 1fr;
         height: 100%;
         padding: 0 1;
+        background: transparent;
     }
     #bottom {
         height: 8;
         padding: 0 1;
         color: $text-muted;
+        background: transparent;
     }
     """
 
