@@ -60,10 +60,17 @@ WHOLE_FILE_WRITE_LABEL = "whole-file write"
 
 @dataclass(frozen=True)
 class DiffSegment:
-    """One renderable diff line: its semantic ``kind`` plus the display text."""
+    """One renderable diff line: its semantic ``kind`` plus the display text.
+
+    ``line_no`` is the 1-based source line number shown in the gutter:
+    - CONTEXT / ADD: new-side line number
+    - DEL: old-side line number
+    - HEADER / TRUNCATION: ``None`` (no gutter number for structural markers)
+    """
 
     kind: DiffKind
     text: str
+    line_no: Optional[int] = None
 
 
 def _split_lines(text: Optional[str]) -> List[str]:
@@ -82,20 +89,30 @@ def _edit_segments(event: FileModifiedEvent) -> List[DiffSegment]:
     segments: List[DiffSegment] = []
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
-            for line in old_lines[i1:i2]:
-                segments.append(DiffSegment(DiffKind.CONTEXT, f"  {line}"))
+            for k, line in enumerate(old_lines[i1:i2]):
+                segments.append(
+                    DiffSegment(DiffKind.CONTEXT, f"  {line}", line_no=j1 + k + 1)
+                )
         elif tag == "delete":
-            for line in old_lines[i1:i2]:
-                segments.append(DiffSegment(DiffKind.DEL, f"- {line}"))
+            for k, line in enumerate(old_lines[i1:i2]):
+                segments.append(
+                    DiffSegment(DiffKind.DEL, f"- {line}", line_no=i1 + k + 1)
+                )
         elif tag == "insert":
-            for line in new_lines[j1:j2]:
-                segments.append(DiffSegment(DiffKind.ADD, f"+ {line}"))
+            for k, line in enumerate(new_lines[j1:j2]):
+                segments.append(
+                    DiffSegment(DiffKind.ADD, f"+ {line}", line_no=j1 + k + 1)
+                )
         elif tag == "replace":
             # A replace is the old block removed AND the new block added.
-            for line in old_lines[i1:i2]:
-                segments.append(DiffSegment(DiffKind.DEL, f"- {line}"))
-            for line in new_lines[j1:j2]:
-                segments.append(DiffSegment(DiffKind.ADD, f"+ {line}"))
+            for k, line in enumerate(old_lines[i1:i2]):
+                segments.append(
+                    DiffSegment(DiffKind.DEL, f"- {line}", line_no=i1 + k + 1)
+                )
+            for k, line in enumerate(new_lines[j1:j2]):
+                segments.append(
+                    DiffSegment(DiffKind.ADD, f"+ {line}", line_no=j1 + k + 1)
+                )
     return segments
 
 
@@ -106,8 +123,8 @@ def _write_segments(event: FileModifiedEvent) -> List[DiffSegment]:
         f"{WHOLE_FILE_WRITE_LABEL}: {event.file_path}",
     )
     body = [
-        DiffSegment(DiffKind.ADD, f"+ {line}")
-        for line in _split_lines(event.full_content)
+        DiffSegment(DiffKind.ADD, f"+ {line}", line_no=i + 1)
+        for i, line in enumerate(_split_lines(event.full_content))
     ]
     return [header, *body]
 

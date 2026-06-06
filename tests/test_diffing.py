@@ -254,6 +254,113 @@ class TestTruncation:
         assert segs[-1].kind is DiffKind.TRUNCATION
 
 
+class TestLineNumbers:
+    """line_no population on DiffSegment — gutter numbers for the Diff panel."""
+
+    # --- DiffSegment default ---
+
+    def test_segment_default_line_no_is_none(self):
+        """Existing call-sites without line_no still work (default=None)."""
+        seg = DiffSegment(kind=DiffKind.ADD, text="+ x")
+        assert seg.line_no is None
+
+    def test_segment_accepts_explicit_line_no(self):
+        seg = DiffSegment(kind=DiffKind.ADD, text="+ x", line_no=42)
+        assert seg.line_no == 42
+
+    # --- Edit: CONTEXT gets new-side number ---
+
+    def test_edit_context_has_new_side_line_number(self):
+        # old="keep\nold", new="keep\nnew" → first line equal (CONTEXT, new-side=1)
+        segs = compute_diff(_edit("keep\nold", "keep\nnew"), AppConfig())
+        ctx = [s for s in segs if s.kind is DiffKind.CONTEXT]
+        assert ctx, "expected a CONTEXT segment"
+        assert ctx[0].line_no == 1  # first line, 1-based on new side
+
+    def test_edit_context_second_block_has_correct_offset(self):
+        # "a\nkeep1\nkeep2\nb" → "a\nkeep1\nkeep2\nc"
+        # The equal run is "keep1","keep2" at new-side positions 2,3
+        old = "a\nkeep1\nkeep2\nb"
+        new = "a\nkeep1\nkeep2\nc"
+        segs = compute_diff(_edit(old, new), AppConfig())
+        ctx = [s for s in segs if s.kind is DiffKind.CONTEXT]
+        # first line "a" at new-side j=0 → line_no=1
+        # "keep1" at j=1 → line_no=2, "keep2" at j=2 → line_no=3
+        ctx_nums = [s.line_no for s in ctx]
+        assert 1 in ctx_nums
+        assert 2 in ctx_nums
+        assert 3 in ctx_nums
+
+    # --- Edit: DEL gets old-side number ---
+
+    def test_edit_del_has_old_side_line_number(self):
+        # old="alpha\nbeta", new="alpha\ngamma" → "beta" DEL at old-side position 2
+        segs = compute_diff(_edit("alpha\nbeta", "alpha\ngamma"), AppConfig())
+        dels = [s for s in segs if s.kind is DiffKind.DEL]
+        assert dels, "expected a DEL segment"
+        assert dels[0].line_no == 2  # "beta" is the 2nd line (1-based) on old side
+
+    def test_edit_del_first_line_has_line_no_1(self):
+        segs = compute_diff(_edit("removed\nkept", "kept"), AppConfig())
+        dels = [s for s in segs if s.kind is DiffKind.DEL]
+        assert dels[0].line_no == 1
+
+    # --- Edit: ADD gets new-side number ---
+
+    def test_edit_add_has_new_side_line_number(self):
+        # old="alpha", new="alpha\nextra" → "extra" ADD at new-side position 2
+        segs = compute_diff(_edit("alpha", "alpha\nextra"), AppConfig())
+        adds = [s for s in segs if s.kind is DiffKind.ADD]
+        assert adds, "expected an ADD segment"
+        assert adds[0].line_no == 2
+
+    def test_edit_add_first_line_has_line_no_1(self):
+        segs = compute_diff(_edit("old line", "new line"), AppConfig())
+        adds = [s for s in segs if s.kind is DiffKind.ADD]
+        assert adds[0].line_no == 1
+
+    def test_edit_replace_del_old_side_add_new_side(self):
+        # "a\nb\nc" → "a\nB\nc": b→B is a replace; DEL "b" at old=2, ADD "B" at new=2
+        old = "a\nb\nc"
+        new = "a\nB\nc"
+        segs = compute_diff(_edit(old, new), AppConfig())
+        dels = [s for s in segs if s.kind is DiffKind.DEL]
+        adds = [s for s in segs if s.kind is DiffKind.ADD]
+        assert dels[0].line_no == 2  # old-side: "b" is line 2
+        assert adds[0].line_no == 2  # new-side: "B" is line 2
+
+    # --- Write: body lines get sequential 1-based numbers ---
+
+    def test_write_body_lines_have_sequential_line_numbers(self):
+        segs = compute_diff(_write("one\ntwo\nthree"), AppConfig())
+        adds = [s for s in segs if s.kind is DiffKind.ADD]
+        assert len(adds) == 3
+        assert adds[0].line_no == 1
+        assert adds[1].line_no == 2
+        assert adds[2].line_no == 3
+
+    def test_write_single_line_has_line_no_1(self):
+        segs = compute_diff(_write("only"), AppConfig())
+        adds = [s for s in segs if s.kind is DiffKind.ADD]
+        assert adds[0].line_no == 1
+
+    # --- Write: HEADER has None ---
+
+    def test_write_header_has_no_line_number(self):
+        segs = compute_diff(_write("x"), AppConfig())
+        headers = [s for s in segs if s.kind is DiffKind.HEADER]
+        assert headers[0].line_no is None
+
+    # --- TRUNCATION always None ---
+
+    def test_truncation_segment_has_no_line_number(self):
+        cfg = AppConfig(diff_max_lines=3)
+        segs = compute_diff(_write("\n".join(str(i) for i in range(20))), cfg)
+        truncations = [s for s in segs if s.kind is DiffKind.TRUNCATION]
+        assert truncations, "expected a TRUNCATION segment"
+        assert truncations[0].line_no is None
+
+
 class TestPurity:
     """The diffing module must stay UI-free (logic/colour-as-data only)."""
 

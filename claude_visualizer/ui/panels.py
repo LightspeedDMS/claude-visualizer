@@ -402,6 +402,11 @@ def render_diff_body(state: DisplayState) -> Text:
     body = Text()
     segments: List[DiffSegment] = list(state.visible_segments)
     for index, segment in enumerate(segments):
+        # Gutter: 4-digit right-aligned line number + space, or 5 spaces blank.
+        if segment.line_no is not None:
+            body.append(f"{segment.line_no:4d} ", style="dim")
+        else:
+            body.append("     ", style="dim")
         style = COLOR_FOR_KIND.get(segment.kind, "")
         body.append(segment.text, style=style)
         if index < len(segments) - 1:

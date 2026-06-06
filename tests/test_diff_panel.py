@@ -240,6 +240,82 @@ class TestRenderDiffBody:
 
 
 # ---------------------------------------------------------------------------
+# Gutter line-number rendering
+# ---------------------------------------------------------------------------
+
+
+class TestGutterRendering:
+    """render_diff_body prepends a 4-digit right-aligned gutter to every line."""
+
+    def test_add_segment_shows_line_number_in_gutter(self):
+        seg = DiffSegment(DiffKind.ADD, "+ new line", line_no=1)
+        text = _plain(render_diff_body(_state(visible_segments=[seg])))
+        assert "   1 + new line" in text
+
+    def test_del_segment_shows_line_number_in_gutter(self):
+        seg = DiffSegment(DiffKind.DEL, "- gone line", line_no=5)
+        text = _plain(render_diff_body(_state(visible_segments=[seg])))
+        assert "   5 - gone line" in text
+
+    def test_context_segment_shows_line_number_in_gutter(self):
+        seg = DiffSegment(DiffKind.CONTEXT, "  same line", line_no=12)
+        text = _plain(render_diff_body(_state(visible_segments=[seg])))
+        assert "  12   same line" in text
+
+    def test_large_line_number_right_aligned_in_4_chars(self):
+        seg = DiffSegment(DiffKind.ADD, "+ last", line_no=999)
+        text = _plain(render_diff_body(_state(visible_segments=[seg])))
+        assert " 999 + last" in text
+
+    def test_4digit_line_number_fits_without_padding(self):
+        seg = DiffSegment(DiffKind.ADD, "+ big", line_no=1234)
+        text = _plain(render_diff_body(_state(visible_segments=[seg])))
+        assert "1234 + big" in text
+
+    def test_header_segment_shows_blank_gutter(self):
+        seg = DiffSegment(DiffKind.HEADER, "whole-file write: /r/x.py")
+        text = _plain(render_diff_body(_state(visible_segments=[seg])))
+        assert "     whole-file write: /r/x.py" in text
+
+    def test_truncation_segment_shows_blank_gutter(self):
+        seg = DiffSegment(DiffKind.TRUNCATION, "…(truncated, 10 more lines)")
+        text = _plain(render_diff_body(_state(visible_segments=[seg])))
+        assert "     …(truncated, 10 more lines)" in text
+
+    def test_segment_without_line_no_shows_blank_gutter(self):
+        seg = DiffSegment(DiffKind.ADD, "+ x")
+        text = _plain(render_diff_body(_state(visible_segments=[seg])))
+        assert "     + x" in text
+
+    def test_multiple_segments_each_have_gutter(self):
+        segs = [
+            DiffSegment(DiffKind.DEL, "- old", line_no=3),
+            DiffSegment(DiffKind.ADD, "+ new", line_no=3),
+        ]
+        text = _plain(render_diff_body(_state(visible_segments=segs)))
+        assert "   3 - old" in text
+        assert "   3 + new" in text
+
+    def test_gutter_style_is_dim(self):
+        # The gutter text "   7 " must be rendered with "dim" style.
+        seg = DiffSegment(DiffKind.ADD, "+ styled", line_no=7)
+        body = render_diff_body(_state(visible_segments=[seg]))
+        plain = body.plain
+        gutter_text = "   7 "
+        gutter_start = plain.index(gutter_text)
+        gutter_end = gutter_start + len(gutter_text)
+        dim_spans = [
+            s
+            for s in body.spans
+            if s.start == gutter_start and s.end == gutter_end and str(s.style) == "dim"
+        ]
+        assert dim_spans, (
+            f"expected a dim span covering {gutter_text!r} at [{gutter_start}:{gutter_end}]; "
+            f"spans: {[(s.start, s.end, str(s.style)) for s in body.spans]}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # render_diff (header + body) + empty state (AC7 no-blank)
 # ---------------------------------------------------------------------------
 
