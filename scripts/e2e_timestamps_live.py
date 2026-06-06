@@ -122,6 +122,7 @@ async def run(screenshot_path: Path) -> None:
         active_window_seconds=3600,
         discovery_interval_seconds=0.05,
         poll_interval_seconds=0.05,
+        cache_path=None,
     )
     app = VisualizerApp(cfg, now=clock)
 

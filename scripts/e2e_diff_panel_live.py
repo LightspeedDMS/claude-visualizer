@@ -135,6 +135,7 @@ async def run(screenshot_path: Path) -> None:
             active_window_seconds=3600,
             discovery_interval_seconds=0.05,
             poll_interval_seconds=0.05,
+            cache_path=None,
         )
         app = VisualizerApp(cfg, now=clock)
 
@@ -160,8 +161,8 @@ async def run(screenshot_path: Path) -> None:
             _check("editSESS" in text, "AC3 header short session", repr("editSESS"))
             _check("- return a - b" in text, "AC1 DEL line present", repr("- return a - b"))
             _check("+ return a + b" in text, "AC1 ADD line present", repr("+ return a + b"))
-            _check("red" in styles, "AC1 DEL coloured red", f"spans={styles!r}")
-            _check("green" in styles, "AC1 ADD coloured green", f"spans={styles!r}")
+            _check("#e06c75" in styles, "AC1 DEL coloured red", f"spans={styles!r}")
+            _check("#98c379" in styles, "AC1 ADD coloured green", f"spans={styles!r}")
 
             # AC9: the displayed file is highlighted (▶) in the MRU list.
             mru_text = mru.rendered_text()
@@ -186,7 +187,7 @@ async def run(screenshot_path: Path) -> None:
             _check("+ import os" in text, "AC2 first addition", repr("+ import os"))
             _check("+ print(os.getcwd())" in text, "AC2 second addition",
                    repr("+ print(os.getcwd())"))
-            _check("green" in wstyles, "AC2 additions coloured green",
+            _check("#98c379" in wstyles, "AC2 additions coloured green",
                    f"spans={wstyles!r}")
 
             # --- 3) THINKING-TURN: 🧠 glyph in header -------------------------
