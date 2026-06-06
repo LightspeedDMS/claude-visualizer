@@ -88,10 +88,10 @@ class TestDiffPrimitives:
             seg.text = "y"  # type: ignore
 
     def test_color_map_add_green(self):
-        assert COLOR_FOR_KIND[DiffKind.ADD] == "green"
+        assert COLOR_FOR_KIND[DiffKind.ADD] == "#98c379"
 
     def test_color_map_del_red(self):
-        assert COLOR_FOR_KIND[DiffKind.DEL] == "red"
+        assert COLOR_FOR_KIND[DiffKind.DEL] == "#e06c75"
 
     def test_color_map_context_dim(self):
         assert COLOR_FOR_KIND[DiffKind.CONTEXT] == "dim"

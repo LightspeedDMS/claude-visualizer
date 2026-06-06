@@ -46,8 +46,8 @@ class DiffKind(Enum):
 # Colour mapping kept as DATA (not baked into a renderer) so the logic stays
 # pure/testable and the UI simply looks up the style for each segment kind.
 COLOR_FOR_KIND = {
-    DiffKind.ADD: "green",
-    DiffKind.DEL: "red",
+    DiffKind.ADD: "#98c379",
+    DiffKind.DEL: "#e06c75",
     DiffKind.CONTEXT: "dim",
     DiffKind.HEADER: "bold cyan",
     DiffKind.TRUNCATION: "dim",

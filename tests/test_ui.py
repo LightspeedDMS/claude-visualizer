@@ -763,8 +763,8 @@ class TestVisualizerAppDiffPanel:
             # The diff body actually carries colour spans (green/red).
             panel = pilot.app.query_one(DiffPanel)
             styles = " ".join(str(s.style) for s in panel._renderable.spans)
-            assert "green" in styles
-            assert "red" in styles
+            assert "#98c379" in styles
+            assert "#e06c75" in styles
 
     async def test_write_renders_whole_file_additions_with_label(self, tmp_path: Path):
         root = tmp_path / "projects"
