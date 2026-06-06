@@ -58,6 +58,7 @@ from claude_visualizer.events import CommandEvent, FileModifiedEvent
 from claude_visualizer.models.command_feed import CommandFeedModel
 from claude_visualizer.models.diff_queue import DiffQueueModel
 from claude_visualizer.models.mru import MruModel
+from claude_visualizer.models.system_stats import SystemStatsModel
 from claude_visualizer.pipeline import Pipeline, route_event
 from claude_visualizer.ui.panels import (
     CommandsPanel,
@@ -65,12 +66,16 @@ from claude_visualizer.ui.panels import (
     HorizontalSeparator,
     MruFilesPanel,
     SplitterHandle,
+    StatusBar,
     diff_viewport_height,
 )
 
 # Fallback content width for the bottom Commands panel before the first layout
 # measures it, so the very first repaint truncates rows to a sensible width.
 _COMMANDS_DEFAULT_WIDTH = 80
+# Fallback content width for the MRU panel before the first layout measures it,
+# so the very first repaint pads rows to a sensible width (40 outer − 2 padding).
+_MRU_DEFAULT_CONTENT_WIDTH = 38
 _MRU_MIN_WIDTH = 10  # minimum MRU panel columns (prevents collapse)
 _BOTTOM_MIN_HEIGHT = 3  # minimum bottom panel rows (title + 2 commands)
 _SPLITTER_STEP = 2  # columns per ←/→ press
@@ -83,6 +88,7 @@ class VisualizerApp(App):
     CSS = """
     Screen {
         layout: vertical;
+        background: transparent;
     }
     #top-row {
         layout: horizontal;
@@ -146,6 +152,8 @@ class VisualizerApp(App):
         # grow/shrink actions would compute 38+2=40 — a no-op.  Tracking the
         # outer value sidesteps that padding-offset mismatch entirely.
         self._mru_width = 40
+        self._stats_model = SystemStatsModel()
+        self._stats_timer: Optional[Timer] = None
 
     def compose(self) -> ComposeResult:
         """Build the 3-region layout: a top row (2 cells) over a bottom cell."""
@@ -155,11 +163,12 @@ class VisualizerApp(App):
             yield DiffPanel(id="top-right")
         yield HorizontalSeparator()
         yield CommandsPanel(id="bottom")
+        yield StatusBar(id="status-bar")
 
     async def on_mount(self) -> None:
         """Start the pipeline, the event consumer, and the diff refresh tick."""
         # Render all three panels once so they show their waiting state.
-        self._mru_panel().update_from_model(self._model)
+        self._mru_panel().update_from_model(self._model, self._mru_content_width())
         self._diff_panel().update_from_state(None)
         self._commands_panel().update_from_model(
             self._command_feed, self._commands_width()
@@ -182,7 +191,9 @@ class VisualizerApp(App):
                 self._diff_queue.fast_forward_to_latest(self._now())
                 state = self._diff_queue.tick(self._now(), self._diff_viewport_height())
                 self._diff_panel().update_from_state(state)
-                self._mru_panel().update_from_model(self._model)
+                self._mru_panel().update_from_model(
+                    self._model, self._mru_content_width()
+                )
                 self._commands_panel().update_from_model(
                     self._command_feed, self._commands_width()
                 )
@@ -206,6 +217,9 @@ class VisualizerApp(App):
         self._refresh_timer = self.set_interval(
             self._config.diff_refresh_seconds, self._refresh_panels
         )
+        self._stats_timer = self.set_interval(
+            self._config.stats_refresh_seconds, self._refresh_stats
+        )
 
     async def on_unmount(self) -> None:
         """Stop the refresh timer, the consumer, and the pipeline on exit.
@@ -214,6 +228,8 @@ class VisualizerApp(App):
         bug: once stopped, no deferred tick can fire into a tree whose panels
         have already been removed (which previously raised ``NoMatches``).
         """
+        if self._stats_timer is not None:
+            self._stats_timer.stop()
         if self._refresh_timer is not None:
             self._refresh_timer.stop()
         if self._cache is not None:
@@ -244,6 +260,20 @@ class VisualizerApp(App):
         width = self._commands_panel().content_size.width
         if width <= 0:
             return _COMMANDS_DEFAULT_WIDTH
+        return max(1, width)
+
+    def _mru_content_width(self) -> int:
+        """Character width available for an MRU row in the left panel.
+
+        Textual's ``content_size`` is the box's CONTENT region — it already
+        excludes the border and padding — so it is the correct width to pad rows
+        to for full-width background fills.  Before the first layout that width
+        is 0 (unmeasured), so we fall back to :data:`_MRU_DEFAULT_CONTENT_WIDTH`
+        to keep the very first repaint sensible; floored at 1.
+        """
+        width = self._mru_panel().content_size.width
+        if width <= 0:
+            return _MRU_DEFAULT_CONTENT_WIDTH
         return max(1, width)
 
     def _diff_viewport_height(self) -> int:
@@ -277,13 +307,21 @@ class VisualizerApp(App):
             # Mirror the displayed file into the MRU highlight (None when
             # idle/empty clears it); repaint so the highlight follows the queue.
             self._model.highlighted_path = state.file_path if state else None
-            self._mru_panel().update_from_model(self._model)
+            self._mru_panel().update_from_model(self._model, self._mru_content_width())
             # Repaint the live Commands feed at the panel's current width (AC5).
             self._commands_panel().update_from_model(
                 self._command_feed, self._commands_width()
             )
         except NoMatches:
             # Panels are gone (post-unmount deferred tick) → nothing to repaint.
+            return
+
+    def _refresh_stats(self) -> None:
+        """Sample system stats and repaint the status bar (1 s cadence)."""
+        try:
+            snapshot = self._stats_model.tick(self._now())
+            self.query_one("#status-bar", StatusBar).update_from_snapshot(snapshot)
+        except NoMatches:
             return
 
     def on_key(self, event) -> None:
@@ -337,7 +375,9 @@ class VisualizerApp(App):
             try:
                 state = self._diff_queue.tick(self._now(), self._diff_viewport_height())
                 self._diff_panel().update_from_state(state)
-                self._mru_panel().update_from_model(self._model)
+                self._mru_panel().update_from_model(
+                    self._model, self._mru_content_width()
+                )
             except Exception:
                 pass  # panel gone (unmount race) — ignore
 
@@ -354,7 +394,7 @@ class VisualizerApp(App):
             state = self._diff_queue.tick(self._now(), self._diff_viewport_height())
             self._diff_panel().update_from_state(state)
             self._model.highlighted_path = state.file_path if state else None
-            self._mru_panel().update_from_model(self._model)
+            self._mru_panel().update_from_model(self._model, self._mru_content_width())
         except NoMatches:
             pass  # panels gone (unmount race) — ignore
 
@@ -368,7 +408,9 @@ class VisualizerApp(App):
                 state = self._diff_queue.tick(self._now(), self._diff_viewport_height())
                 self._diff_panel().update_from_state(state)
                 self._model.highlighted_path = message.file_path
-                self._mru_panel().update_from_model(self._model)
+                self._mru_panel().update_from_model(
+                    self._model, self._mru_content_width()
+                )
             except Exception:
                 pass  # panel gone (unmount race) — ignore
 
@@ -392,7 +434,7 @@ class VisualizerApp(App):
                 self._diff_queue,
                 command_feed=self._command_feed,
             )
-            mru_panel.update_from_model(self._model)
+            mru_panel.update_from_model(self._model, self._mru_content_width())
             commands_panel.update_from_model(self._command_feed, self._commands_width())
             if self._cache is not None:
                 try:

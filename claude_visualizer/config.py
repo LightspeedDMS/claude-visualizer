@@ -90,6 +90,9 @@ class AppConfig:
     # event can release it — prevents flapping on rapid activity.
     min_pin_seconds: float = 10.0
 
+    # Cadence at which the status bar samples psutil and repaints.
+    stats_refresh_seconds: float = 0.5
+
     # --- Persistence cache --------------------------------------------------
     # Path to the SQLite cache that persists the last-seen state across
     # restarts.  Set to None to disable caching entirely.

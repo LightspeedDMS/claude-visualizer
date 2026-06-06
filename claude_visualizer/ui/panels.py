@@ -30,9 +30,10 @@ render path".
 
 from __future__ import annotations
 
+import math
 import os
 from datetime import datetime
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from rich.text import Text
 from textual.message import Message
@@ -43,6 +44,9 @@ from claude_visualizer.diffing import COLOR_FOR_KIND, DiffSegment
 from claude_visualizer.models.command_feed import CommandFeedEntry, CommandFeedModel
 from claude_visualizer.models.diff_queue import DisplayState
 from claude_visualizer.models.mru import MruEntry, MruModel
+
+if TYPE_CHECKING:
+    from claude_visualizer.models.system_stats import SystemStatsSnapshot
 
 # Marker appended to a row when its source transcript is a subagent
 # (``.../subagents/agent-*.jsonl``).
@@ -69,6 +73,20 @@ MRU_HIGHLIGHT_STYLE = "bold reverse"
 # path wraps onto multiple terminal lines.  Even rows inherit the terminal
 # default and carry no extra span.
 MRU_ROW_STYLE_ODD = "on #262626"
+# Full style for odd rows: bright foreground on dark background so text is
+# readable against the tinted background (diff-editor contrast style).
+MRU_ROW_STYLE_ODD_FULL = f"bright_white {MRU_ROW_STYLE_ODD}"
+# Foreground colour for even rows: slightly muted so even/odd alternate visually
+# without requiring a background tint on even rows.
+MRU_ROW_STYLE_EVEN = "#aaaaaa"
+
+# --- Status bar (system stats) -------------------------------------------
+_STATS_BAR_WIDTH = 12
+_STATS_BAR_FILL = "█"
+_STATS_BAR_EMPTY = "░"
+_STATS_GREEN = "green"
+_STATS_YELLOW = "yellow"
+_STATS_RED = "red"
 
 # --- Diff panel (story #3) ------------------------------------------------
 # Header line for the Diff panel.
@@ -154,7 +172,7 @@ def format_mru_row(entry: MruEntry, highlighted: bool = False) -> str:
     return line
 
 
-def render_mru(model: MruModel, scroll_offset: int = 0) -> Text:
+def render_mru(model: MruModel, scroll_offset: int = 0, width: int = 0) -> Text:
     """Render the MRU model as a newest-first Rich block, newest at the top.
 
     Returns a waiting message (still inside the titled block) when the model
@@ -166,6 +184,10 @@ def render_mru(model: MruModel, scroll_offset: int = 0) -> Text:
     ``scroll_offset`` skips the first N rows so the panel can be scrolled
     through a list longer than the visible area.  A ``scroll_offset`` of 0
     (the default) shows from the top, so all existing call-sites are unchanged.
+
+    ``width`` when > 0 pads each row with trailing spaces so the background
+    colour fills the full panel width (diff-editor style), rather than ending
+    at the last text character.
     """
     out = Text()
     out.append(f"{MRU_TITLE}\n\n", style="bold")
@@ -181,9 +203,24 @@ def render_mru(model: MruModel, scroll_offset: int = 0) -> Text:
         is_hl = entry.file_path == model.highlighted_path
         if is_hl:
             style = MRU_HIGHLIGHT_STYLE
+        elif (scroll_offset + index) % 2 == 1:
+            style = MRU_ROW_STYLE_ODD_FULL
         else:
-            style = MRU_ROW_STYLE_ODD if (scroll_offset + index) % 2 == 1 else ""
-        out.append(format_mru_row(entry, highlighted=is_hl), style=style)
+            style = MRU_ROW_STYLE_EVEN
+        row_text = format_mru_row(entry, highlighted=is_hl)
+        if width > 0:
+            line_count = max(1, math.ceil(len(row_text) / width))
+            target = line_count * width
+            padded = row_text + " " * (target - len(row_text))
+            # Chunk into width-sized pieces so Rich never word-wraps mid-row.
+            # Word wrapping produces short lines (e.g. 19 chars instead of 38)
+            # leaving the right portion of each visual line without background.
+            for chunk_start in range(0, target, width):
+                out.append(padded[chunk_start : chunk_start + width], style=style)
+                if chunk_start + width < target:
+                    out.append("\n")
+        else:
+            out.append(row_text, style=style)
         if index < len(visible) - 1:
             out.append("\n")
     return out
@@ -215,17 +252,19 @@ class MruFilesPanel(Static):
         self._last_model: Optional[MruModel] = (
             None  # stored for scroll re-render without a new model push
         )
+        self._last_width: int = 0  # stored for scroll re-render at same width
 
-    def update_from_model(self, model: MruModel) -> None:
+    def update_from_model(self, model: MruModel, width: int = 0) -> None:
         """Re-render the panel from the model's current rows."""
         self._last_model = model
+        self._last_width = width
         self._rows = model.rows()  # snapshot for click-to-row mapping
         # Clamp so a shrinking list doesn't leave the offset past the end.
         if self._rows:
             self._scroll_offset = min(self._scroll_offset, len(self._rows) - 1)
         else:
             self._scroll_offset = 0
-        self._renderable = render_mru(model, self._scroll_offset)
+        self._renderable = render_mru(model, self._scroll_offset, width)
         if self.is_mounted:
             self.refresh()
 
@@ -236,7 +275,9 @@ class MruFilesPanel(Static):
         self._scroll_offset = max(
             0, min(self._scroll_offset + delta, len(self._rows) - 1)
         )
-        self._renderable = render_mru(self._last_model, self._scroll_offset)
+        self._renderable = render_mru(
+            self._last_model, self._scroll_offset, self._last_width
+        )
         if self.is_mounted:
             self.refresh()
 
@@ -284,8 +325,12 @@ class MruFilesPanel(Static):
         return self._renderable
 
     def rendered_text(self) -> str:
-        """Return the panel's current plain text (used by tests/assertions)."""
-        return self._renderable.plain
+        """Return the panel's current plain text (used by tests/assertions).
+
+        Newlines are stripped so file-path substrings remain contiguous even
+        when the chunked renderer breaks a long path across visual lines.
+        """
+        return self._renderable.plain.replace("\n", "")
 
 
 # ---------------------------------------------------------------------------
@@ -602,3 +647,99 @@ class HorizontalSeparator(Widget):
     def render(self) -> Text:
         width = max(1, self.size.width)
         return Text("─" * width, style="dim")
+
+
+# ---------------------------------------------------------------------------
+# Status bar — system resource stats (CPU / RAM / Disk IO / Net IO)
+# ---------------------------------------------------------------------------
+
+
+def _bar_colour(pct: float) -> str:
+    if pct >= 80:
+        return _STATS_RED
+    if pct >= 60:
+        return _STATS_YELLOW
+    return _STATS_GREEN
+
+
+def _fmt_rate(bps: float) -> str:
+    """Format a byte rate as a 7-char right-padded human-readable string."""
+    if bps < 1024:
+        s = f"{int(bps)}B/s"
+    elif bps < 1024**2:
+        val = bps / 1024
+        s = f"{val:.1f}K/s" if val < 100 else f"{val:.0f}K/s"
+    elif bps < 1024**3:
+        val = bps / 1024**2
+        s = f"{val:.1f}M/s" if val < 100 else f"{val:.0f}M/s"
+    else:
+        val = bps / 1024**3
+        s = f"{val:.1f}G/s" if val < 100 else f"{val:.0f}G/s"
+    return s.ljust(7)
+
+
+def render_status_bar(snapshot: SystemStatsSnapshot) -> Text:
+    """Render the one-line system-stats bar (Design B)."""
+    out = Text(no_wrap=True, overflow="ellipsis")
+
+    def _bar(pct: float) -> None:
+        filled = min(_STATS_BAR_WIDTH, round(_STATS_BAR_WIDTH * pct / 100))
+        out.append(
+            _STATS_BAR_FILL * filled + _STATS_BAR_EMPTY * (_STATS_BAR_WIDTH - filled),
+            style=_bar_colour(pct),
+        )
+
+    out.append(" CPU ")
+    _bar(snapshot.cpu_pct)
+    out.append(f" {int(snapshot.cpu_pct)}%")
+
+    out.append(" │ ", style="dim")
+    out.append("RAM ")
+    _bar(snapshot.ram_pct)
+    out.append(f" {int(snapshot.ram_pct)}%")
+
+    free = snapshot.ram_free_bytes
+    if free >= 1024**3:
+        out.append(f"  {free / 1024 ** 3:.1f}G free")
+    else:
+        out.append(f"  {free / 1024 ** 2:.0f}M free")
+
+    out.append(" │ ", style="dim")
+    out.append(
+        f"Disk r:{_fmt_rate(snapshot.disk_read_bps)}"
+        f" w:{_fmt_rate(snapshot.disk_write_bps)}"
+    )
+    out.append(" │ ", style="dim")
+    out.append(
+        f"Net ↓{_fmt_rate(snapshot.net_down_bps)}" f" ↑{_fmt_rate(snapshot.net_up_bps)}"
+    )
+
+    return out
+
+
+class StatusBar(Static):
+    """Docked single-row system resource bar (CPU / RAM / Disk IO / Net IO).
+
+    Renders the output of :func:`render_status_bar` in a 1-row widget anchored
+    to the bottom of the screen so it is always visible without consuming layout
+    space from the Commands panel above.
+    """
+
+    DEFAULT_CSS = """
+    StatusBar {
+        dock: bottom;
+        height: 1;
+    }
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__("", **kwargs)
+        self._renderable: Text = Text("")
+
+    def update_from_snapshot(self, snapshot: SystemStatsSnapshot) -> None:
+        self._renderable = render_status_bar(snapshot)
+        if self.is_mounted:
+            self.refresh()
+
+    def render(self) -> Text:
+        return self._renderable

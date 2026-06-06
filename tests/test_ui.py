@@ -385,6 +385,49 @@ class TestRenderMru:
         assert len(zebra) == 0
         assert len(highlight) == 1
 
+    def test_short_path_padded_to_width(self):
+        """A path shorter than panel width is padded to exactly width."""
+        model = MruModel(AppConfig(mru_max=10))
+        model.record(_file_event(file_path="a.py"))
+        # width=80: the decorated row ("HH:MM:SS ... a.py   proj · sess1234") is ~42 chars,
+        # shorter than 80, so it pads to exactly 80.
+        text = render_mru(model, width=80)
+        plain = text.plain
+        # plain starts with the title + blank line; the actual row is the last segment
+        row_content = plain.split("\n")[-1]
+        assert len(row_content) == 80, f"Expected 80, got {len(row_content)}"
+
+    def test_long_path_padded_to_next_width_multiple(self):
+        """A path longer than panel width gets padded to the next multiple of
+        width so every wrapped visual line has a full-width background span."""
+        model = MruModel(AppConfig(mru_max=10))
+        # Record two entries so the second (odd) row gets a zebra span — the
+        # long path is the FIRST recorded (oldest) so it ends up at index 1 (odd).
+        model.record(
+            _file_event(
+                file_path="/very/long/path/that/exceeds/panel/width/filename.py"
+            )
+        )
+        model.record(_file_event(file_path="/r/b.py"))  # newest → index 0 (even)
+        # Use width=20 so the long path row (index 1 = odd) exceeds 1 visual line.
+        text = render_mru(model, width=20)
+        plain = text.plain
+        # Split on newline; the two rows are separated by a single '\n'.
+        # rows()[0] = newest = b.py (even, no zebra), rows()[1] = long path (odd, zebra).
+        lines = plain.split("\n")
+        # plain = "title\n\nnewst_row\nlong_row"; long path is oldest → last line
+        long_row = lines[-1]
+        assert (
+            len(long_row) % 20 == 0
+        ), f"Expected len to be multiple of 20, got {len(long_row)}"
+        # The zebra-odd span must cover the padded length.
+        zebra = [s for s in text.spans if MRU_ROW_STYLE_ODD in str(s.style)]
+        assert len(zebra) >= 1
+        span = zebra[0]
+        assert (span.end - span.start) == len(
+            long_row
+        ), f"Span length {span.end - span.start} != row length {len(long_row)}"
+
 
 # ---------------------------------------------------------------------------
 # Commands feed pure formatters (ui.panels) — story #4
@@ -1295,3 +1338,146 @@ class TestVisualizerAppTeardown:
         # Panels are gone now.  A stray deferred tick must be a defensive no-op
         # (panel query misses → return early) rather than raising NoMatches.
         app._refresh_panels()  # must NOT raise
+
+
+# ---------------------------------------------------------------------------
+# Status bar pure renderer (render_status_bar + _fmt_rate)
+# ---------------------------------------------------------------------------
+
+
+def _snapshot(
+    cpu_pct: float = 42.0,
+    ram_pct: float = 61.0,
+    ram_free_bytes: int = 4_000_000_000,
+    disk_read_bps: float = 1_200_000.0,
+    disk_write_bps: float = 340_000.0,
+    net_down_bps: float = 4_200_000.0,
+    net_up_bps: float = 128_000.0,
+):
+    from claude_visualizer.models.system_stats import SystemStatsSnapshot
+
+    return SystemStatsSnapshot(
+        cpu_pct=cpu_pct,
+        ram_pct=ram_pct,
+        ram_free_bytes=ram_free_bytes,
+        disk_read_bps=disk_read_bps,
+        disk_write_bps=disk_write_bps,
+        net_down_bps=net_down_bps,
+        net_up_bps=net_up_bps,
+    )
+
+
+class TestRenderStatusBar:
+    """Tests 7-14: render_status_bar pure formatter — content and colour spans."""
+
+    def test_render_status_bar_contains_cpu_pct(self):
+        from claude_visualizer.ui.panels import render_status_bar
+
+        text = render_status_bar(_snapshot(cpu_pct=42.0))
+        assert "42%" in text.plain
+
+    def test_render_status_bar_bar_length(self):
+        from claude_visualizer.ui.panels import (
+            _STATS_BAR_EMPTY,
+            _STATS_BAR_FILL,
+            _STATS_BAR_WIDTH,
+            render_status_bar,
+        )
+
+        text = render_status_bar(_snapshot(cpu_pct=50.0))
+        plain = text.plain
+        bar_chars = set(_STATS_BAR_FILL + _STATS_BAR_EMPTY)
+        runs = []
+        run_len = 0
+        for ch in plain:
+            if ch in bar_chars:
+                run_len += 1
+            else:
+                if run_len > 0:
+                    runs.append(run_len)
+                run_len = 0
+        if run_len > 0:
+            runs.append(run_len)
+        assert len(runs) >= 2, "Expected at least 2 bar runs (CPU and RAM)"
+        for r in runs:
+            assert r == _STATS_BAR_WIDTH, f"bar run length {r} != {_STATS_BAR_WIDTH}"
+
+    def test_render_status_bar_green_below_60(self):
+        from claude_visualizer.ui.panels import _STATS_GREEN, render_status_bar
+
+        text = render_status_bar(_snapshot(cpu_pct=42.0))
+        green_spans = [s for s in text.spans if _STATS_GREEN in str(s.style)]
+        assert green_spans, "Expected green style for cpu_pct=42 (< 60%)"
+
+    def test_render_status_bar_yellow_60_to_80(self):
+        from claude_visualizer.ui.panels import _STATS_YELLOW, render_status_bar
+
+        text = render_status_bar(_snapshot(cpu_pct=70.0))
+        yellow_spans = [s for s in text.spans if _STATS_YELLOW in str(s.style)]
+        assert yellow_spans, "Expected yellow style for cpu_pct=70 (60–80%)"
+
+    def test_render_status_bar_red_above_80(self):
+        from claude_visualizer.ui.panels import _STATS_RED, render_status_bar
+
+        text = render_status_bar(_snapshot(cpu_pct=85.0))
+        red_spans = [s for s in text.spans if _STATS_RED in str(s.style)]
+        assert red_spans, "Expected red style for cpu_pct=85 (>= 80%)"
+
+    def test_render_status_bar_contains_ram_free_label(self):
+        from claude_visualizer.ui.panels import render_status_bar
+
+        text = render_status_bar(_snapshot(ram_free_bytes=9_877_947_392))
+        assert "free" in text.plain
+
+    def test_render_status_bar_contains_disk_label(self):
+        from claude_visualizer.ui.panels import render_status_bar
+
+        text = render_status_bar(_snapshot())
+        assert "Disk" in text.plain
+
+    def test_render_status_bar_contains_net_label(self):
+        from claude_visualizer.ui.panels import render_status_bar
+
+        text = render_status_bar(_snapshot())
+        assert "Net" in text.plain
+
+
+class TestFmtRate:
+    """Tests 15-19: _fmt_rate auto-scaling and fixed-width padding."""
+
+    def test_fmt_rate_bytes(self):
+        from claude_visualizer.ui.panels import _fmt_rate
+
+        result = _fmt_rate(512.0)
+        assert "512" in result
+        assert "B/s" in result
+
+    def test_fmt_rate_kilobytes(self):
+        from claude_visualizer.ui.panels import _fmt_rate
+
+        result = _fmt_rate(1536.0)
+        assert "1.5" in result
+        assert "K/s" in result
+
+    def test_fmt_rate_megabytes(self):
+        from claude_visualizer.ui.panels import _fmt_rate
+
+        result = _fmt_rate(1_572_864.0)
+        assert "1.5" in result
+        assert "M/s" in result
+
+    def test_fmt_rate_gigabytes(self):
+        from claude_visualizer.ui.panels import _fmt_rate
+
+        result = _fmt_rate(1_610_612_736.0)
+        assert "1.5" in result
+        assert "G/s" in result
+
+    def test_fmt_rate_padded_to_7_chars(self):
+        from claude_visualizer.ui.panels import _fmt_rate
+
+        for bps in [0.0, 512.0, 1536.0, 1_048_576.0, 1_073_741_824.0]:
+            result = _fmt_rate(bps)
+            assert (
+                len(result) == 7
+            ), f"_fmt_rate({bps!r}) = {result!r} len={len(result)}"

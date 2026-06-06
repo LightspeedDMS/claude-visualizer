@@ -7,6 +7,33 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.2.0] — 2026-06-05
+
+### Added
+
+**System stats status bar**
+
+- New docked bottom bar showing live CPU %, RAM %, Disk IO (read/write byte rates), and Net IO (down/up byte rates).
+- `SystemStatsModel` — pure (no Textual) model in `models/system_stats.py`; samples `psutil` each tick and computes 5-second rolling-average byte rates; clamped to 0 on counter reset.
+- `render_status_bar()` / `StatusBar` widget in `ui/panels.py`; block-fill progress bars colour-coded green/yellow/red by load; rate values formatted as `B/s` / `K/s` / `M/s` / `G/s`.
+- Configurable `stats_refresh_seconds` (default 0.5 s) in `AppConfig`.
+- Handles `None` from `psutil.disk_io_counters()` / `psutil.net_io_counters()` gracefully (shows 0 B/s rather than crashing — relevant on macOS non-root).
+- `tests/test_system_stats.py` — 11 unit tests (first-tick zero rates, second-tick rate computation, counter-reset clamping, CPU/RAM pass-through, None-counter guard); psutil mocked at the external boundary.
+- `scripts/e2e_status_bar_live.py` — live E2E driver that boots the real app and asserts all four section labels, `│` separators, IO rate units, MRU rows, and zebra spans.
+
+**MRU full-width zebra stripes**
+
+- Odd MRU rows now fill the entire panel width with `on #262626` background (diff-editor style) even when a long file path wraps across multiple terminal lines.
+- Root cause fixed: Rich's word-wrap was breaking padded rows at spaces, leaving right-side gaps. Fix pre-chunks each row into exact `width`-character pieces before appending so Rich never sees a string long enough to wrap.
+- `MruFilesPanel.rendered_text()` strips `\n` so file-path substrings remain contiguous in test assertions after chunked rendering.
+- Two new tests in `tests/test_ui.py`: short-path row padded to exact width; long-path row padded to next `width` multiple with correct zebra span coverage.
+
+### Changed
+
+- `Screen` CSS sets `background: transparent` so the app uses the terminal's own background colour rather than forcing black — looks correct on both dark and light terminals.
+
+---
+
 ## [0.1.0] — 2026-06-05
 
 Initial release.
@@ -68,4 +95,5 @@ Initial release.
 
 - `lint.sh` — ruff + black + mypy; all checks pass clean on release.
 
+[0.2.0]: https://github.com/LightspeedDMS/claude-visualizer/releases/tag/v0.2.0
 [0.1.0]: https://github.com/LightspeedDMS/claude-visualizer/releases/tag/v0.1.0
