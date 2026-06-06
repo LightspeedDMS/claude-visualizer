@@ -86,6 +86,9 @@ class VisualizerApp(App):
     """Blocking full-screen app: live MRU panel + live Diff panel."""
 
     CSS = """
+    App {
+        background: transparent;
+    }
     Screen {
         layout: vertical;
         background: transparent;
