@@ -87,35 +87,38 @@ class VisualizerApp(App):
 
     CSS = """
     App {
-        background: transparent;
+        background: ansi_default;
     }
     Screen {
         layout: vertical;
-        background: transparent;
+        background: ansi_default;
+    }
+    Static {
+        background: ansi_default;
     }
     #top-row {
         layout: horizontal;
         height: 1fr;
         overflow: hidden hidden;
-        background: transparent;
+        background: ansi_default;
     }
     #mru-panel {
         width: 40;
         height: 100%;
         padding: 0 1;
-        background: transparent;
+        background: ansi_default;
     }
     #top-right {
         width: 1fr;
         height: 100%;
         padding: 0 1;
-        background: transparent;
+        background: ansi_default;
     }
     #bottom {
         height: 8;
         padding: 0 1;
         color: $text-muted;
-        background: transparent;
+        background: ansi_default;
     }
     """
 
