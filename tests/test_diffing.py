@@ -268,66 +268,58 @@ class TestLineNumbers:
         seg = DiffSegment(kind=DiffKind.ADD, text="+ x", line_no=42)
         assert seg.line_no == 42
 
-    # --- Edit: CONTEXT gets new-side number ---
+    # --- Edit: all body segments have line_no=None (relative offsets are misleading) ---
 
-    def test_edit_context_has_new_side_line_number(self):
-        # old="keep\nold", new="keep\nnew" → first line equal (CONTEXT, new-side=1)
+    def test_edit_context_line_no_is_none(self):
+        # Edit CONTEXT segments must NOT carry line numbers (offsets are snippet-relative,
+        # not true file positions, so they would be misleading).
         segs = compute_diff(_edit("keep\nold", "keep\nnew"), AppConfig())
         ctx = [s for s in segs if s.kind is DiffKind.CONTEXT]
         assert ctx, "expected a CONTEXT segment"
-        assert ctx[0].line_no == 1  # first line, 1-based on new side
+        assert all(s.line_no is None for s in ctx)
 
-    def test_edit_context_second_block_has_correct_offset(self):
-        # "a\nkeep1\nkeep2\nb" → "a\nkeep1\nkeep2\nc"
-        # The equal run is "keep1","keep2" at new-side positions 2,3
+    def test_edit_context_multi_line_all_none(self):
         old = "a\nkeep1\nkeep2\nb"
         new = "a\nkeep1\nkeep2\nc"
         segs = compute_diff(_edit(old, new), AppConfig())
         ctx = [s for s in segs if s.kind is DiffKind.CONTEXT]
-        # first line "a" at new-side j=0 → line_no=1
-        # "keep1" at j=1 → line_no=2, "keep2" at j=2 → line_no=3
-        ctx_nums = [s.line_no for s in ctx]
-        assert 1 in ctx_nums
-        assert 2 in ctx_nums
-        assert 3 in ctx_nums
+        assert all(s.line_no is None for s in ctx)
 
-    # --- Edit: DEL gets old-side number ---
+    # --- Edit: DEL has line_no=None ---
 
-    def test_edit_del_has_old_side_line_number(self):
-        # old="alpha\nbeta", new="alpha\ngamma" → "beta" DEL at old-side position 2
+    def test_edit_del_line_no_is_none(self):
         segs = compute_diff(_edit("alpha\nbeta", "alpha\ngamma"), AppConfig())
         dels = [s for s in segs if s.kind is DiffKind.DEL]
         assert dels, "expected a DEL segment"
-        assert dels[0].line_no == 2  # "beta" is the 2nd line (1-based) on old side
+        assert all(s.line_no is None for s in dels)
 
-    def test_edit_del_first_line_has_line_no_1(self):
+    def test_edit_del_first_line_no_is_none(self):
         segs = compute_diff(_edit("removed\nkept", "kept"), AppConfig())
         dels = [s for s in segs if s.kind is DiffKind.DEL]
-        assert dels[0].line_no == 1
+        assert all(s.line_no is None for s in dels)
 
-    # --- Edit: ADD gets new-side number ---
+    # --- Edit: ADD has line_no=None ---
 
-    def test_edit_add_has_new_side_line_number(self):
-        # old="alpha", new="alpha\nextra" → "extra" ADD at new-side position 2
+    def test_edit_add_line_no_is_none(self):
         segs = compute_diff(_edit("alpha", "alpha\nextra"), AppConfig())
         adds = [s for s in segs if s.kind is DiffKind.ADD]
         assert adds, "expected an ADD segment"
-        assert adds[0].line_no == 2
+        assert all(s.line_no is None for s in adds)
 
-    def test_edit_add_first_line_has_line_no_1(self):
+    def test_edit_add_first_line_no_is_none(self):
         segs = compute_diff(_edit("old line", "new line"), AppConfig())
         adds = [s for s in segs if s.kind is DiffKind.ADD]
-        assert adds[0].line_no == 1
+        assert all(s.line_no is None for s in adds)
 
-    def test_edit_replace_del_old_side_add_new_side(self):
-        # "a\nb\nc" → "a\nB\nc": b→B is a replace; DEL "b" at old=2, ADD "B" at new=2
+    def test_edit_replace_all_segments_line_no_none(self):
+        # All DEL and ADD segments from a replace opcode must have line_no=None.
         old = "a\nb\nc"
         new = "a\nB\nc"
         segs = compute_diff(_edit(old, new), AppConfig())
         dels = [s for s in segs if s.kind is DiffKind.DEL]
         adds = [s for s in segs if s.kind is DiffKind.ADD]
-        assert dels[0].line_no == 2  # old-side: "b" is line 2
-        assert adds[0].line_no == 2  # new-side: "B" is line 2
+        assert all(s.line_no is None for s in dels)
+        assert all(s.line_no is None for s in adds)
 
     # --- Write: body lines get sequential 1-based numbers ---
 

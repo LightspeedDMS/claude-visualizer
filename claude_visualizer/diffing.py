@@ -89,30 +89,20 @@ def _edit_segments(event: FileModifiedEvent) -> List[DiffSegment]:
     segments: List[DiffSegment] = []
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
-            for k, line in enumerate(old_lines[i1:i2]):
-                segments.append(
-                    DiffSegment(DiffKind.CONTEXT, f"  {line}", line_no=j1 + k + 1)
-                )
+            for line in old_lines[i1:i2]:
+                segments.append(DiffSegment(DiffKind.CONTEXT, f"  {line}"))
         elif tag == "delete":
-            for k, line in enumerate(old_lines[i1:i2]):
-                segments.append(
-                    DiffSegment(DiffKind.DEL, f"- {line}", line_no=i1 + k + 1)
-                )
+            for line in old_lines[i1:i2]:
+                segments.append(DiffSegment(DiffKind.DEL, f"- {line}"))
         elif tag == "insert":
-            for k, line in enumerate(new_lines[j1:j2]):
-                segments.append(
-                    DiffSegment(DiffKind.ADD, f"+ {line}", line_no=j1 + k + 1)
-                )
+            for line in new_lines[j1:j2]:
+                segments.append(DiffSegment(DiffKind.ADD, f"+ {line}"))
         elif tag == "replace":
             # A replace is the old block removed AND the new block added.
-            for k, line in enumerate(old_lines[i1:i2]):
-                segments.append(
-                    DiffSegment(DiffKind.DEL, f"- {line}", line_no=i1 + k + 1)
-                )
-            for k, line in enumerate(new_lines[j1:j2]):
-                segments.append(
-                    DiffSegment(DiffKind.ADD, f"+ {line}", line_no=j1 + k + 1)
-                )
+            for line in old_lines[i1:i2]:
+                segments.append(DiffSegment(DiffKind.DEL, f"- {line}"))
+            for line in new_lines[j1:j2]:
+                segments.append(DiffSegment(DiffKind.ADD, f"+ {line}"))
     return segments
 
 
