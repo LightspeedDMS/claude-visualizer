@@ -86,39 +86,28 @@ class VisualizerApp(App):
     """Blocking full-screen app: live MRU panel + live Diff panel."""
 
     CSS = """
-    App {
-        background: ansi_default;
-    }
     Screen {
         layout: vertical;
-        background: ansi_default;
-    }
-    Static {
-        background: ansi_default;
     }
     #top-row {
         layout: horizontal;
         height: 1fr;
         overflow: hidden hidden;
-        background: ansi_default;
     }
     #mru-panel {
         width: 40;
         height: 100%;
         padding: 0 1;
-        background: ansi_default;
     }
     #top-right {
         width: 1fr;
         height: 100%;
         padding: 0 1;
-        background: ansi_default;
     }
     #bottom {
         height: 8;
         padding: 0 1;
         color: $text-muted;
-        background: ansi_default;
     }
     """
 
