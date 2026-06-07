@@ -33,7 +33,7 @@ from __future__ import annotations
 import math
 import os
 from datetime import datetime
-from typing import TYPE_CHECKING, List, Optional
+from typing import List, Optional
 
 from rich.text import Text
 from textual.message import Message
@@ -44,9 +44,6 @@ from claude_visualizer.diffing import COLOR_FOR_KIND, DiffSegment
 from claude_visualizer.models.command_feed import CommandFeedEntry, CommandFeedModel
 from claude_visualizer.models.diff_queue import DisplayState
 from claude_visualizer.models.mru import MruEntry, MruModel
-
-if TYPE_CHECKING:
-    from claude_visualizer.models.system_stats import SystemStatsSnapshot
 
 # Marker appended to a row when its source transcript is a subagent
 # (``.../subagents/agent-*.jsonl``).
@@ -79,14 +76,6 @@ MRU_ROW_STYLE_ODD_FULL = f"bright_white {MRU_ROW_STYLE_ODD}"
 # Foreground colour for even rows: slightly muted so even/odd alternate visually
 # without requiring a background tint on even rows.
 MRU_ROW_STYLE_EVEN = "#aaaaaa"
-
-# --- Status bar (system stats) -------------------------------------------
-_STATS_BAR_WIDTH = 12
-_STATS_BAR_FILL = "█"
-_STATS_BAR_EMPTY = "░"
-_STATS_GREEN = "green"
-_STATS_YELLOW = "yellow"
-_STATS_RED = "red"
 
 # --- Diff panel (story #3) ------------------------------------------------
 # Header line for the Diff panel.
@@ -615,6 +604,101 @@ class CommandsPanel(Static):
         return self._renderable.plain
 
 
+# ---------------------------------------------------------------------------
+# Monitor bar — pluggable per-monitor stacked rows (story #6)
+# ---------------------------------------------------------------------------
+
+
+def _filter_active_monitor_lines(lines: list) -> list:
+    """Return only non-empty entries from a monitor tick result list.
+
+    A line is considered active (non-empty) when:
+    - it is a ``str`` with at least one character, or
+    - it is a ``rich.text.Text`` whose ``.plain`` is non-empty.
+
+    Empty strings and ``Text("")`` are suppressed-monitor entries; callers
+    should hide those rows rather than rendering a blank line.
+    """
+    active: list = []
+    for line in lines:
+        if isinstance(line, Text):
+            if line.plain:
+                active.append(line)
+        elif isinstance(line, str):
+            if line:
+                active.append(line)
+        elif line:
+            # N2: a misbehaving plugin may return a truthy non-str/non-Text
+            # value (e.g. an int). Coerce to str so render_monitor_bar can never
+            # raise TypeError on a refresh tick — same fault-isolation spirit as
+            # AC5. Falsy non-str values stay suppressed.
+            active.append(str(line))
+    return active
+
+
+def render_monitor_bar(lines: list) -> Text:
+    """Render a list of monitor lines as a stacked Rich block.
+
+    Skips any entry that is an empty string or a ``Text`` whose ``.plain``
+    is empty — those are suppressed monitors (AC2).  The result contains only
+    non-empty lines joined by newlines.  NEVER appends an empty trailing line
+    (``Text("")`` appended to a ``Text`` object costs 1 display row — the
+    Textual height gotcha).
+    """
+    active = _filter_active_monitor_lines(lines)
+    out = Text()
+    for i, line in enumerate(active):
+        if isinstance(line, Text):
+            out.append_text(line)
+        else:
+            out.append(line)
+        if i < len(active) - 1:
+            out.append("\n")
+    return out
+
+
+class MonitorBar(Static):
+    """Docked bottom bar showing one row per active monitor.
+
+    ``update_from_lines`` accepts the list returned by ``MonitorRegistry.tick()``,
+    filters out suppressed (empty) monitors, and either shows the stacked rows
+    or sets ``display = False`` when ALL monitors are suppressed (AC3).
+
+    ``DEFAULT_CSS`` docks at the bottom with ``height: auto`` so the bar height
+    equals the number of active monitor rows automatically (AC3).
+    """
+
+    DEFAULT_CSS = """
+    MonitorBar {
+        dock: bottom;
+        height: auto;
+    }
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__("", **kwargs)
+        self._renderable: Text = Text("")
+
+    def update_from_lines(self, lines: list) -> None:
+        """Re-render from monitor tick results; collapse to invisible when all empty."""
+        active = _filter_active_monitor_lines(lines)
+        if not active:
+            self.display = False
+        else:
+            self.display = True
+            self._renderable = render_monitor_bar(lines)
+            if self.is_mounted:
+                self.refresh()
+
+    def render(self) -> Text:
+        """Return the current Rich renderable (Textual repaints from this)."""
+        return self._renderable
+
+    def rendered_text(self) -> str:
+        """Return the panel's current plain text (used by tests/assertions)."""
+        return self._renderable.plain
+
+
 class SplitterHandle(Widget):
     """Thin │ vertical line between MRU and Diff panels — visual only.
 
@@ -652,99 +736,3 @@ class HorizontalSeparator(Widget):
     def render(self) -> Text:
         width = max(1, self.size.width)
         return Text("─" * width, style="dim")
-
-
-# ---------------------------------------------------------------------------
-# Status bar — system resource stats (CPU / RAM / Disk IO / Net IO)
-# ---------------------------------------------------------------------------
-
-
-def _bar_colour(pct: float) -> str:
-    if pct >= 80:
-        return _STATS_RED
-    if pct >= 60:
-        return _STATS_YELLOW
-    return _STATS_GREEN
-
-
-def _fmt_rate(bps: float) -> str:
-    """Format a byte rate as a 7-char right-padded human-readable string."""
-    if bps < 1024:
-        s = f"{int(bps)}B/s"
-    elif bps < 1024**2:
-        val = bps / 1024
-        s = f"{val:.1f}K/s" if val < 100 else f"{val:.0f}K/s"
-    elif bps < 1024**3:
-        val = bps / 1024**2
-        s = f"{val:.1f}M/s" if val < 100 else f"{val:.0f}M/s"
-    else:
-        val = bps / 1024**3
-        s = f"{val:.1f}G/s" if val < 100 else f"{val:.0f}G/s"
-    return s.ljust(7)
-
-
-def render_status_bar(snapshot: SystemStatsSnapshot) -> Text:
-    """Render the one-line system-stats bar (Design B)."""
-    out = Text(no_wrap=True, overflow="ellipsis")
-
-    def _bar(pct: float) -> None:
-        filled = min(_STATS_BAR_WIDTH, round(_STATS_BAR_WIDTH * pct / 100))
-        out.append(
-            _STATS_BAR_FILL * filled + _STATS_BAR_EMPTY * (_STATS_BAR_WIDTH - filled),
-            style=_bar_colour(pct),
-        )
-
-    out.append(" CPU ")
-    _bar(snapshot.cpu_pct)
-    out.append(f" {int(snapshot.cpu_pct)}%")
-
-    out.append(" │ ", style="dim")
-    out.append("RAM ")
-    _bar(snapshot.ram_pct)
-    out.append(f" {int(snapshot.ram_pct)}%")
-
-    free = snapshot.ram_free_bytes
-    if free >= 1024**3:
-        out.append(f"  {free / 1024 ** 3:.1f}G free")
-    else:
-        out.append(f"  {free / 1024 ** 2:.0f}M free")
-
-    out.append(" │ ", style="dim")
-    out.append(
-        f"Disk r:{_fmt_rate(snapshot.disk_read_bps)}"
-        f" w:{_fmt_rate(snapshot.disk_write_bps)}"
-    )
-    out.append(" │ ", style="dim")
-    out.append(
-        f"Net ↓{_fmt_rate(snapshot.net_down_bps)}" f" ↑{_fmt_rate(snapshot.net_up_bps)}"
-    )
-
-    return out
-
-
-class StatusBar(Static):
-    """Docked single-row system resource bar (CPU / RAM / Disk IO / Net IO).
-
-    Renders the output of :func:`render_status_bar` in a 1-row widget anchored
-    to the bottom of the screen so it is always visible without consuming layout
-    space from the Commands panel above.
-    """
-
-    DEFAULT_CSS = """
-    StatusBar {
-        dock: bottom;
-        height: 1;
-    }
-    """
-
-    def __init__(self, **kwargs) -> None:
-        super().__init__("", **kwargs)
-        self._renderable: Text = Text("")
-
-    def update_from_snapshot(self, snapshot: SystemStatsSnapshot) -> None:
-        self._renderable = render_status_bar(snapshot)
-        if self.is_mounted:
-            self.refresh()
-
-    def render(self) -> Text:
-        return self._renderable

@@ -57,16 +57,16 @@ from claude_visualizer.config import AppConfig
 from claude_visualizer.events import CommandEvent, FileModifiedEvent
 from claude_visualizer.models.command_feed import CommandFeedModel
 from claude_visualizer.models.diff_queue import DiffQueueModel
+from claude_visualizer.models.monitor_registry import MonitorRegistry
 from claude_visualizer.models.mru import MruModel
-from claude_visualizer.models.system_stats import SystemStatsModel
 from claude_visualizer.pipeline import Pipeline, route_event
 from claude_visualizer.ui.panels import (
     CommandsPanel,
     DiffPanel,
     HorizontalSeparator,
+    MonitorBar,
     MruFilesPanel,
     SplitterHandle,
-    StatusBar,
     diff_viewport_height,
 )
 
@@ -151,8 +151,8 @@ class VisualizerApp(App):
         # grow/shrink actions would compute 38+2=40 — a no-op.  Tracking the
         # outer value sidesteps that padding-offset mismatch entirely.
         self._mru_width = 40
-        self._stats_model = SystemStatsModel()
-        self._stats_timer: Optional[Timer] = None
+        self._monitor_registry = MonitorRegistry(config)
+        self._monitors_timer: Optional[Timer] = None
 
     def compose(self) -> ComposeResult:
         """Build the 3-region layout: a top row (2 cells) over a bottom cell."""
@@ -162,7 +162,7 @@ class VisualizerApp(App):
             yield DiffPanel(id="top-right")
         yield HorizontalSeparator()
         yield CommandsPanel(id="bottom")
-        yield StatusBar(id="status-bar")
+        yield MonitorBar(id="monitor-bar")
 
     async def on_mount(self) -> None:
         """Start the pipeline, the event consumer, and the diff refresh tick."""
@@ -216,8 +216,15 @@ class VisualizerApp(App):
         self._refresh_timer = self.set_interval(
             self._config.diff_refresh_seconds, self._refresh_panels
         )
-        self._stats_timer = self.set_interval(
-            self._config.stats_refresh_seconds, self._refresh_stats
+        # Load pluggable monitors; drain any load errors as warnings so the app
+        # starts even when a user monitor has a syntax error.
+        self._monitor_registry.load()
+        for err in self._monitor_registry.load_errors:
+            self.log.warning(f"Monitor load error: {err}")
+        # Paint monitor bar once with the initial tick so it shows up immediately.
+        self._refresh_monitors()
+        self._monitors_timer = self.set_interval(
+            self._config.monitor_refresh_seconds, self._refresh_monitors
         )
 
     async def on_unmount(self) -> None:
@@ -227,8 +234,8 @@ class VisualizerApp(App):
         bug: once stopped, no deferred tick can fire into a tree whose panels
         have already been removed (which previously raised ``NoMatches``).
         """
-        if self._stats_timer is not None:
-            self._stats_timer.stop()
+        if self._monitors_timer is not None:
+            self._monitors_timer.stop()
         if self._refresh_timer is not None:
             self._refresh_timer.stop()
         if self._cache is not None:
@@ -315,11 +322,11 @@ class VisualizerApp(App):
             # Panels are gone (post-unmount deferred tick) → nothing to repaint.
             return
 
-    def _refresh_stats(self) -> None:
-        """Sample system stats and repaint the status bar (1 s cadence)."""
+    def _refresh_monitors(self) -> None:
+        """Tick all monitors and repaint the monitor bar (monitor_refresh_seconds cadence)."""
         try:
-            snapshot = self._stats_model.tick(self._now())
-            self.query_one("#status-bar", StatusBar).update_from_snapshot(snapshot)
+            lines = self._monitor_registry.tick(self._now())
+            self.query_one("#monitor-bar", MonitorBar).update_from_lines(lines)
         except NoMatches:
             return
 

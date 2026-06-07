@@ -19,6 +19,36 @@ END_MARK="# <<< claude-visualizer alias (managed by install.sh) <<<"
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# --- Seed bundled monitors into ~/.claude-visualizer/monitors/ ---------------
+# Copies every non-underscore *.py from the package monitors/ dir into the
+# user's monitors directory, always overwriting software-delivered files so
+# updates are picked up on re-install.  User files with DIFFERENT names are
+# left untouched because the loop only writes basenames it ships.
+# The _* pattern covers both __init__.py and single-underscore helpers.
+seed_monitors() {
+  local src_dir="$PROJECT_DIR/claude_visualizer/monitors"
+  local dst_dir="$HOME/.claude-visualizer/monitors"
+  mkdir -p "$dst_dir"
+  for src in "$src_dir"/*.py; do
+    local base
+    base="$(basename "$src")"
+    # Skip __init__.py and any underscore-prefixed helpers (_* matches both).
+    case "$base" in
+      _*) continue ;;
+    esac
+    cp -f "$src" "$dst_dir/$base"
+  done
+  info "Monitor files seeded into $dst_dir"
+}
+
+# Testable seam: invoke just the seed logic without triggering venv/pip work.
+# Must be placed AFTER PROJECT_DIR and helpers are defined but BEFORE any
+# venv or pip commands so the AC6 test never triggers a pip install.
+if [ "${1:-}" = "--seed-monitors-only" ]; then
+  seed_monitors
+  exit 0
+fi
+
 # --- 1. Find a Python 3.11+ interpreter --------------------------------------
 # The system `python3` may be older than 3.11 (e.g. RHEL 9 ships 3.9), so prefer
 # a versioned interpreter and accept plain `python3` only if it is itself >= 3.11.
@@ -52,7 +82,10 @@ APP_BIN="$VENV_DIR/bin/$ALIAS_NAME"
 [ -x "$APP_BIN" ] || die "Expected console script missing after install: $APP_BIN"
 info "App installed: $APP_BIN"
 
-# --- 4. Create / refresh the `claude-visualizer` alias (idempotent) ----------
+# --- 4. Seed bundled monitor files into ~/.claude-visualizer/monitors/ -------
+seed_monitors
+
+# --- 5. Create / refresh the `claude-visualizer` alias (idempotent) ----------
 # Writes a marker-delimited block so re-running this script replaces (never
 # duplicates) the alias, and an uninstall could remove exactly this block.
 write_alias() {

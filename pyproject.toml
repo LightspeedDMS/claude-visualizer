@@ -12,6 +12,8 @@ dependencies = [
     "watchfiles>=0.21.0",
     "rich>=13.0.0",
     "psutil>=5.9",
+    "requests>=2.31",
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]

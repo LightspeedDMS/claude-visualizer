@@ -35,10 +35,12 @@ from claude_visualizer.ui.panels import (
     TRUNCATION_ELLIPSIS,
     CommandsPanel,
     DiffPanel,
+    MonitorBar,
     MruFilesPanel,
     format_command_row,
     format_mru_row,
     render_commands,
+    render_monitor_bar,
     render_mru,
     truncate_command,
 )
@@ -1368,16 +1370,21 @@ def _snapshot(
 
 
 class TestRenderStatusBar:
-    """Tests 7-14: render_status_bar pure formatter — content and colour spans."""
+    """Tests 7-14: render_status_bar pure formatter — content and colour spans.
+
+    RELOCATED from panels.py to monitors/zzz_machine_stats.py (AC4).
+    Assertions are byte-identical to the pre-refactor tests; only the import
+    source changes to prove the bundled monitor is functionally equivalent.
+    """
 
     def test_render_status_bar_contains_cpu_pct(self):
-        from claude_visualizer.ui.panels import render_status_bar
+        from claude_visualizer.monitors.zzz_machine_stats import render_status_bar
 
         text = render_status_bar(_snapshot(cpu_pct=42.0))
         assert "42%" in text.plain
 
     def test_render_status_bar_bar_length(self):
-        from claude_visualizer.ui.panels import (
+        from claude_visualizer.monitors.zzz_machine_stats import (
             _STATS_BAR_EMPTY,
             _STATS_BAR_FILL,
             _STATS_BAR_WIDTH,
@@ -1403,81 +1410,156 @@ class TestRenderStatusBar:
             assert r == _STATS_BAR_WIDTH, f"bar run length {r} != {_STATS_BAR_WIDTH}"
 
     def test_render_status_bar_green_below_60(self):
-        from claude_visualizer.ui.panels import _STATS_GREEN, render_status_bar
+        from claude_visualizer.monitors.zzz_machine_stats import (
+            _STATS_GREEN,
+            render_status_bar,
+        )
 
         text = render_status_bar(_snapshot(cpu_pct=42.0))
         green_spans = [s for s in text.spans if _STATS_GREEN in str(s.style)]
         assert green_spans, "Expected green style for cpu_pct=42 (< 60%)"
 
     def test_render_status_bar_yellow_60_to_80(self):
-        from claude_visualizer.ui.panels import _STATS_YELLOW, render_status_bar
+        from claude_visualizer.monitors.zzz_machine_stats import (
+            _STATS_YELLOW,
+            render_status_bar,
+        )
 
         text = render_status_bar(_snapshot(cpu_pct=70.0))
         yellow_spans = [s for s in text.spans if _STATS_YELLOW in str(s.style)]
         assert yellow_spans, "Expected yellow style for cpu_pct=70 (60–80%)"
 
     def test_render_status_bar_red_above_80(self):
-        from claude_visualizer.ui.panels import _STATS_RED, render_status_bar
+        from claude_visualizer.monitors.zzz_machine_stats import (
+            _STATS_RED,
+            render_status_bar,
+        )
 
         text = render_status_bar(_snapshot(cpu_pct=85.0))
         red_spans = [s for s in text.spans if _STATS_RED in str(s.style)]
         assert red_spans, "Expected red style for cpu_pct=85 (>= 80%)"
 
     def test_render_status_bar_contains_ram_free_label(self):
-        from claude_visualizer.ui.panels import render_status_bar
+        from claude_visualizer.monitors.zzz_machine_stats import render_status_bar
 
         text = render_status_bar(_snapshot(ram_free_bytes=9_877_947_392))
         assert "free" in text.plain
 
     def test_render_status_bar_contains_disk_label(self):
-        from claude_visualizer.ui.panels import render_status_bar
+        from claude_visualizer.monitors.zzz_machine_stats import render_status_bar
 
         text = render_status_bar(_snapshot())
         assert "Disk" in text.plain
 
     def test_render_status_bar_contains_net_label(self):
-        from claude_visualizer.ui.panels import render_status_bar
+        from claude_visualizer.monitors.zzz_machine_stats import render_status_bar
 
         text = render_status_bar(_snapshot())
         assert "Net" in text.plain
 
 
 class TestFmtRate:
-    """Tests 15-19: _fmt_rate auto-scaling and fixed-width padding."""
+    """Tests 15-19: _fmt_rate auto-scaling and fixed-width padding.
+
+    RELOCATED from panels.py to monitors/zzz_machine_stats.py (AC4).
+    """
 
     def test_fmt_rate_bytes(self):
-        from claude_visualizer.ui.panels import _fmt_rate
+        from claude_visualizer.monitors.zzz_machine_stats import _fmt_rate
 
         result = _fmt_rate(512.0)
         assert "512" in result
         assert "B/s" in result
 
     def test_fmt_rate_kilobytes(self):
-        from claude_visualizer.ui.panels import _fmt_rate
+        from claude_visualizer.monitors.zzz_machine_stats import _fmt_rate
 
         result = _fmt_rate(1536.0)
         assert "1.5" in result
         assert "K/s" in result
 
     def test_fmt_rate_megabytes(self):
-        from claude_visualizer.ui.panels import _fmt_rate
+        from claude_visualizer.monitors.zzz_machine_stats import _fmt_rate
 
         result = _fmt_rate(1_572_864.0)
         assert "1.5" in result
         assert "M/s" in result
 
     def test_fmt_rate_gigabytes(self):
-        from claude_visualizer.ui.panels import _fmt_rate
+        from claude_visualizer.monitors.zzz_machine_stats import _fmt_rate
 
         result = _fmt_rate(1_610_612_736.0)
         assert "1.5" in result
         assert "G/s" in result
 
     def test_fmt_rate_padded_to_7_chars(self):
-        from claude_visualizer.ui.panels import _fmt_rate
+        from claude_visualizer.monitors.zzz_machine_stats import _fmt_rate
 
         for bps in [0.0, 512.0, 1536.0, 1_048_576.0, 1_073_741_824.0]:
             result = _fmt_rate(bps)
             assert (
                 len(result) == 7
             ), f"_fmt_rate({bps!r}) = {result!r} len={len(result)}"
+
+
+# ---------------------------------------------------------------------------
+# MonitorBar pure renderer — render_monitor_bar (story #6, AC2)
+# ---------------------------------------------------------------------------
+
+
+class TestMonitorBarPure:
+    """Pure render_monitor_bar formatter — suppression and ordering (AC2)."""
+
+    def test_non_empty_lines_rendered_in_order(self):
+        """N non-empty lines → Text whose .plain has exactly N lines in order."""
+        result = render_monitor_bar(["line-A", "line-B", "line-C"])
+        assert result.plain.splitlines() == ["line-A", "line-B", "line-C"]
+
+    def test_empty_str_skipped(self):
+        """Empty string entries are excluded from the rendered output (AC2)."""
+        result = render_monitor_bar(["alpha", "", "beta"])
+        assert result.plain.splitlines() == ["alpha", "beta"]
+
+    def test_empty_rich_text_skipped(self):
+        """Empty Text('') entries are excluded from the rendered output (AC2)."""
+        from rich.text import Text as RichText
+
+        result = render_monitor_bar(["alpha", RichText(""), "beta"])
+        assert result.plain.splitlines() == ["alpha", "beta"]
+
+    def test_all_empty_yields_empty_text(self):
+        """All-suppressed list → empty Text (no rows in output)."""
+        from rich.text import Text as RichText
+
+        result = render_monitor_bar(["", RichText("")])
+        assert result.plain == ""
+
+
+# ---------------------------------------------------------------------------
+# MonitorBar widget — display/collapse behavior (story #6, AC3)
+# ---------------------------------------------------------------------------
+
+
+class TestMonitorBarWidget:
+    """MonitorBar widget display=True/False gating and row stacking (AC3)."""
+
+    def test_n_active_display_true_correct_rows(self):
+        """N non-empty lines → display=True, rendered_text has N rows (AC3)."""
+        bar = MonitorBar()
+        bar.update_from_lines(["row-1", "row-2", "row-3"])
+        assert bar.display is True
+        assert bar.rendered_text().splitlines() == ["row-1", "row-2", "row-3"]
+
+    def test_all_suppressed_display_false(self):
+        """All-empty input → display=False (bar collapses to 0 rows, AC3)."""
+        from rich.text import Text as RichText
+
+        bar = MonitorBar()
+        bar.update_from_lines(["", RichText("")])
+        assert bar.display is False
+
+    def test_empty_list_display_false(self):
+        """Empty monitor list (no monitors loaded) → display=False."""
+        bar = MonitorBar()
+        bar.update_from_lines([])
+        assert bar.display is False

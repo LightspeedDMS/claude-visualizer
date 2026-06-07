@@ -90,8 +90,20 @@ class AppConfig:
     # event can release it — prevents flapping on rapid activity.
     min_pin_seconds: float = 10.0
 
-    # Cadence at which the status bar samples psutil and repaints.
-    stats_refresh_seconds: float = 0.5
+    # Cadence at which the monitor bar samples all monitors and repaints.
+    monitor_refresh_seconds: float = 0.5
+
+    # --- Pluggable monitors -------------------------------------------------
+    # Directory scanned for user-added monitor .py files on startup.
+    # Default: ~/.claude-visualizer/monitors
+    monitors_dir: Path = field(
+        default_factory=lambda: Path.home() / ".claude-visualizer" / "monitors"
+    )
+
+    # Maximum width (characters) of a per-monitor error message shown in the
+    # bar when a monitor's tick() raises.  Bounded so the bar never overflows
+    # on a pathologically long exception string (MESSI #14).
+    monitor_error_width: int = 60
 
     # --- Persistence cache --------------------------------------------------
     # Path to the SQLite cache that persists the last-seen state across

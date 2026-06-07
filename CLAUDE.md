@@ -24,7 +24,12 @@ Routing is by event type: `FileModifiedEvent` → MRU + diff queue; `CommandEven
 
 - **`config.py`** — `AppConfig` frozen dataclass. EVERY tunable lives here
   (windows, caps, intervals, byte limits). Nothing is hardcoded elsewhere;
-  pass an `AppConfig` through the graph for testability.
+  pass an `AppConfig` through the graph for testability. Story #6 additions:
+  `monitor_refresh_seconds` (cadence for `_refresh_monitors`, default 0.5 s;
+  note: previously named `stats_refresh_seconds` which is gone),
+  `monitors_dir` (path scanned by `MonitorRegistry`, default
+  `~/.claude-visualizer/monitors/`), `monitor_error_width` (max chars for a
+  per-monitor `⚠` warning row, default 60).
 - **`events.py`** — immutable event dataclasses. `FileModifiedEvent`
   (Write→`full_content`; Edit→`old_string`/`new_string`/`replace_all`) and
   `CommandEvent` (Bash). Events are arrival-ordered, NOT timestamp-sorted.
@@ -67,6 +72,54 @@ Routing is by event type: `FileModifiedEvent` → MRU + diff queue; `CommandEven
 - **`pipeline.py`** — async orchestration (`Pipeline` + pure `route_event`).
   Runs discovery + tail + parse in one asyncio loop and produces `Event`s onto
   a **bounded** `asyncio.Queue`. The producer; the UI is the consumer.
+- **`models/monitor_registry.py`** — PURE (no `textual`) pluggable monitor
+  registry (story #6). `MonitorRegistry(config)` scans `config.monitors_dir`
+  for `*.py` files (alphabetical order, skips `_`-prefixed names), imports each
+  via `importlib.util`, instantiates its `Monitor` class, and retains instances
+  across ticks so per-monitor state persists. `load()` populates `_monitors` and
+  `load_errors` (one `"<filename>: <error>"` string per failed import). `tick(now)
+  -> list[str | Text]` calls each instance's `tick(now)`; per-monitor exceptions
+  are caught and replaced with `"⚠ <filename>: <error>"` truncated to
+  `config.monitor_error_width` — other monitors continue (AC5).
+- **`monitors/`** — bundled monitor subpackage. `monitors/__init__.py` is
+  documentation only. `monitors/zzz_machine_stats.py` is the RELOCATED home of
+  the system-resource bar (CPU/RAM/Disk/Net) that was previously rendered by
+  `ui/panels.py`; it exposes a `Monitor` class whose `tick(now)` returns the
+  same `render_status_bar(snapshot)` `Text` as before, so all 12
+  `test_system_stats.py` and 13 `TestRenderStatusBar`/`TestFmtRate` tests are
+  unchanged — only the import path shifts. The `zzz_` prefix ensures this
+  bundled monitor sorts last so user monitors appear above it in the bar (AC1).
+  `monitors/proxmox_cluster.py` (story #7) is a **drop-in Monitor plugin** —
+  zero edits to core modules. `Monitor.__init__` reads
+  `~/.claude-visualizer/proxmox.yaml` (PyYAML) into a `ProxmoxConfig`
+  dataclass (`nodes`, `token_id`, `token_secret`, `poll_interval_seconds=30`,
+  `alert_rotate_seconds=10`, `verify_ssl=False`); a missing file sets
+  `_config=None`. `tick(now)` returns `"⚠ proxmox.yaml not found"` when config
+  is absent, `"PVE: connecting…"` while the first poll is still pending, or a
+  Rich `Text` bar from `render_proxmox_bar(snapshot, alert_index)`. Poll is
+  throttled by two fields: `_polled_once: bool` (False until the first real
+  poll completes) and `_last_poll: float` (monotonic time of last poll). Guard
+  is `not _polled_once OR now - _last_poll >= poll_interval_seconds` — using a
+  dedicated boolean avoids the `_last_poll==0.0` sentinel ambiguity (AC3/AC10
+  fix — see gotcha). **Background polling (B1):** `tick()` calls
+  `_submit_fetch()` which creates a standalone `concurrent.futures.Future`,
+  starts a plain `threading.Thread(daemon=True)` that resolves it via
+  `_fetch()`, and returns the future. `_in_flight` holds the in-flight future;
+  a second `tick()` while a fetch is running skips submission (de-dupe). On
+  collect: `if _in_flight.done(): result = _in_flight.result(); if result is
+  not None: _snapshot = result; _in_flight = None`. Daemon threads mean
+  interpreter / app exit is never blocked by an in-progress HTTP call. No
+  `ThreadPoolExecutor` (see gotcha). Each poll tries 4 GETs per node in order
+  (`/cluster/status`, `/cluster/ceph/status`, `/cluster/ha/resources`,
+  `/nodes`) with 5 s timeout and `PVEAPIToken` auth; the first node to answer
+  all four endpoints wins (node failover). On total failure `_snapshot` is
+  retained unchanged (stale-snapshot). `build_alerts()` maps Ceph
+  `health.checks` codes to CRIT/WARN/INFO (unknown codes → WARN verbatim),
+  adds node-offline/CPU/RAM/HA alerts, and stable-sorts CRIT→WARN→INFO.
+  The current alert rotates every `alert_rotate_seconds` (ring-buffer index).
+  Renderer layout: `Cluster: OK/WARN/ERR │ Ceph: <status> │ <name>● per node
+  │ ● per OSD (id asc) osds │ ↻ ⚑ <alert>` or `↻ no alerts`.
+  Dependencies: `requests>=2.31` (HTTP), `pyyaml>=6` (config).
 - **`ui/panels.py`** — pure formatters + thin `Static` widgets (no IO/parse on
   the render path). MRU: `format_mru_row`/`render_mru` + `MruFilesPanel`. Diff
   (story #3): `shorten_model` (strips `claude-`), `format_diff_header`
@@ -83,7 +136,15 @@ Routing is by event type: `FileModifiedEvent` → MRU + diff queue; `CommandEven
   `HH:MM:SS` or `MISSING_TIME_TEXT`; `project · session` + `⤷sub`),
   `render_commands(model, width)` (newest-on-top block, waiting text when empty)
   + the `CommandsPanel` widget. (`PlaceholderPanel` was removed once story #4
-  filled the bottom region — MESSI #12 anti-orphan.)
+  filled the bottom region — MESSI #12 anti-orphan.) Monitor bar (story #6):
+  `_filter_active_monitor_lines(lines)` strips empty `str`/`Text` entries
+  (suppressed monitors), `render_monitor_bar(lines)` joins the remaining entries
+  with newlines (NEVER appends a trailing newline — `Text("")` appended to a
+  `Text` costs one display row, the Textual height-1 gotcha). `MonitorBar`
+  (`dock: bottom; height: auto`) calls `update_from_lines(lines)` → sets
+  `display = False` when ALL monitors are suppressed (AC3), otherwise renders
+  the stacked rows and calls `refresh()`. The bar height equals the number of
+  active monitor rows automatically because `height: auto` (AC3).
 - **Per-item timestamp (all three panels).** `_format_time(ts) -> "HH:MM:SS"`
   (or `MISSING_TIME_TEXT` `--:--:--` when `ts is None`, fail-soft display only)
   is the SINGLE time formatter (one `strftime`, one `TIME_FORMAT`) — DRY,
@@ -109,7 +170,13 @@ Routing is by event type: `FileModifiedEvent` → MRU + diff queue; `CommandEven
   already excluding border/padding; default `_COMMANDS_DEFAULT_WIDTH` pre-layout)
   — AC5. The Commands feed is also repainted immediately in the consume loop so a
   command surfaces promptly. Clock injected (`now=`) for deterministic tests;
-  production uses `time.monotonic`.
+  production uses `time.monotonic`. Monitor bar (story #6): `MonitorRegistry`
+  is instantiated in `__init__`; on mount `load()` is called and any
+  `load_errors` are emitted as `log.warning`; `_refresh_monitors()` is called
+  once immediately (so the bar shows up on first paint), then driven by a
+  second `set_interval(monitor_refresh_seconds, _refresh_monitors)` timer (also
+  stored and stopped in `on_unmount`). `MonitorBar` is yielded in `compose()`
+  as `#monitor-bar` and queried by id in `_refresh_monitors`.
 - **`__main__.py`** — CLI entry (`build_config`/`build_app`/`main`); `--projects-root`
   + tunable overrides (incl. `--mru-max`, `--command-feed-max`). Both
   `claude-visualizer` and `python -m claude_visualizer`.
@@ -243,10 +310,61 @@ PRECEDES the `tool_use` entry but shares the same **entry-level** `requestId`
   rendered MRU row, the Diff header, AND the command row each display the
   expected `HH:MM:SS`, then writes an SVG showing the time in all three panels.
   Run: `TEXTUAL=headless .venv/bin/python scripts/e2e_timestamps_live.py out.svg`.
+  `scripts/e2e_monitor_bar_live.py` is the **pluggable monitor bar** (story #6)
+  live driver: it boots the REAL app against a temp `projects_root` and a temp
+  `monitors_dir` seeded with a normal monitor (`aaa_first.py` → `"monitor-A"`),
+  a third monitor (`ccc_third.py` → `"monitor-C"`), a suppressing monitor
+  (`bbb_suppress.py` → `""`), a raising monitor (`ddd_raiser.py` → raises
+  `RuntimeError`), and a copy of the bundled `zzz_machine_stats.py`; asserts
+  AC1 (alphabetical tick order: A before C), AC2 (suppressed monitor produces
+  no blank row), AC3 (`MonitorBar.display=True`, ≥ 3 active rows), AC4
+  (bundled stats line contains CPU/RAM/Disk/Net), AC5 (raising monitor produces
+  `⚠ ddd_raiser.py: e2e-boom` warning row); then writes an SVG.
+  Run: `TEXTUAL=headless .venv/bin/python scripts/e2e_monitor_bar_live.py out.svg`.
+  `scripts/e2e_proxmox_monitor_live.py` is the **Proxmox cluster monitor**
+  (story #7) live driver: it first attempts a real poll against the cluster
+  configured in `~/.claude-visualizer/proxmox.yaml`; if the cluster answers
+  (**LIVE path**) it asserts the rendered `MonitorBar` line contains `Cluster:`,
+  `Ceph:`, at least one `●` node/OSD dot, and an alert section (`↻`/`⚑`/`no
+  alerts`). If the cluster is unreachable (**DEGRADED path**, user-approved
+  fallback), it deterministically exercises all three degraded Monitor states
+  without fabricating data: `⚠ proxmox.yaml not found` (missing config),
+  `PVE: connecting…` (config present, first poll fails), and stale-snapshot
+  retention (snapshot stays `None` across repeated failed polls); also boots the
+  real app with a missing-config wrapper and asserts the bar renders the `⚠`
+  warning. Never prints the `token_secret`. Always writes a real SVG.
+  Run: `TEXTUAL=headless .venv/bin/python scripts/e2e_proxmox_monitor_live.py out.svg`.
   Full-screen boot of the installed binary against a fixture:
   `TEXTUAL=headless timeout 5 .venv/bin/claude-visualizer --projects-root <fixture>`
   — it runs full-screen until the deadline (timeout → exit 124, no traceback);
   with no timeout it blocks until `q`/`Ctrl+C` and restores the terminal cleanly.
+
+### proxmox monitor: B1 background-poll — manual daemon thread, NOT ThreadPoolExecutor
+The original B1 fix used `ThreadPoolExecutor(max_workers=1, initializer=_daemon_init)`
+where `_daemon_init` called `threading.current_thread().daemon = True`. On Python
+3.11 this raises `RuntimeError("cannot set daemon status of active thread")` inside
+the initializer — you cannot daemonize a thread that has already started. This
+corrupted the entire pool (`BrokenThreadPool`), meaning `_fetch()` never ran
+(monitor stayed on `"PVE: connecting…"` forever) and every subsequent `tick()` call
+past the first re-raise raised `BrokenThreadPool`.
+
+**Current design (`_submit_fetch`)**: creates a plain `concurrent.futures.Future`,
+starts a `threading.Thread(daemon=True)` — daemon flag set BEFORE `start()`, which
+is the only valid moment — that calls `_fetch()` and resolves the future, then
+returns the future. No executor, no pool, no broken initializer. The regression test
+`TestRealHttpServerFetch::test_background_fetch_populates_snapshot_via_real_http`
+(real in-process HTTP server on an ephemeral port) proves the background thread
+actually runs and populates `_snapshot`.
+
+### proxmox monitor: `_polled_once` sentinel (`monitors/proxmox_cluster.py`, story #7)
+The poll guard originally used `self._last_poll == 0.0` as the "never polled"
+sentinel. This caused an AC3 regression: `tick(0.0)` polls and sets
+`_last_poll = 0.0`; then `tick(15.0)` sees `_last_poll == 0.0` → polls again,
+violating the 30 s throttle. Fix: a dedicated `_polled_once: bool = False` flag
+(AC10 keeps `_last_poll` at `0.0` on a fresh instance for tests that inspect
+it). Guard is now `not self._polled_once OR now - self._last_poll >=
+poll_interval_seconds`. Inside the block, `_polled_once` is set to `True` and
+`_last_poll = now` after every poll attempt (success or failure).
 
 ### Development install: use EDITABLE (`pip install -e .`)
 `install.sh` does a NON-editable `pip install "$PROJECT_DIR"` — it COPIES the
@@ -261,7 +379,10 @@ stale site-packages `panels.py`. Fix: `.venv/bin/python -m pip install -e .`
 (editable) so the binary, the scripts, and the working tree are ONE source of
 truth. `python -c` from the repo dir resolves to the working tree (cwd on path),
 which is why it masked the discrepancy — always validate the live binary/scripts
-after a fresh checkout or a non-editable install.
+after a fresh checkout or a non-editable install. The same applies after adding
+the `monitors/` subpackage (story #6): until `.venv/bin/python -m pip install
+-e .` is re-run, `claude_visualizer.monitors.zzz_machine_stats` is not
+importable from the installed binary or the live E2E scripts.
 
 ## Testing
 
