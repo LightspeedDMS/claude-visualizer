@@ -180,13 +180,14 @@ class TestConfigLoad:
         m = Monitor(config_path=tmp_path / "nonexistent.yaml")
         assert m._config is None
 
-    def test_missing_yaml_tick_returns_dim_warning(self, tmp_path: Path) -> None:
+    def test_missing_yaml_tick_returns_empty_string(self, tmp_path: Path) -> None:
+        """AC1 updated: no config → tick() returns exactly '' (silent, no row)."""
         from claude_visualizer.monitors.proxmox_cluster import Monitor
 
         m = Monitor(config_path=tmp_path / "nonexistent.yaml")
         result = m.tick(1.0)
-        assert isinstance(result, Text)
-        assert "proxmox.yaml not found" in result.plain
+        # Must be exactly the empty string — MonitorBar suppresses empty results.
+        assert result == "", f"Expected empty string, got {result!r}"
 
     def test_missing_yaml_tick_does_not_raise(self, tmp_path: Path) -> None:
         from claude_visualizer.monitors.proxmox_cluster import Monitor
@@ -1935,6 +1936,477 @@ class TestCrushNullChildren:
 # ---------------------------------------------------------------------------
 # Review Nit 2 — OSD endpoint failure: graceful degrade to empty OSD list
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# TestHumanizeAge — pure unit tests for _humanize_age helper (E6)
+# ---------------------------------------------------------------------------
+
+
+class TestHumanizeAge:
+    """_humanize_age returns Ns / Nm / Nh with correct boundary values."""
+
+    def test_zero_seconds(self) -> None:
+        from claude_visualizer.monitors.proxmox_cluster import _humanize_age
+
+        assert _humanize_age(0) == "0s"
+
+    def test_30_seconds(self) -> None:
+        from claude_visualizer.monitors.proxmox_cluster import _humanize_age
+
+        assert _humanize_age(30) == "30s"
+
+    def test_59_seconds(self) -> None:
+        from claude_visualizer.monitors.proxmox_cluster import _humanize_age
+
+        assert _humanize_age(59) == "59s"
+
+    def test_60_seconds_is_1m(self) -> None:
+        from claude_visualizer.monitors.proxmox_cluster import _humanize_age
+
+        assert _humanize_age(60) == "1m"
+
+    def test_90_seconds_is_1m(self) -> None:
+        from claude_visualizer.monitors.proxmox_cluster import _humanize_age
+
+        assert _humanize_age(90) == "1m"
+
+    def test_3599_seconds_is_59m(self) -> None:
+        from claude_visualizer.monitors.proxmox_cluster import _humanize_age
+
+        assert _humanize_age(3599) == "59m"
+
+    def test_3600_seconds_is_1h(self) -> None:
+        from claude_visualizer.monitors.proxmox_cluster import _humanize_age
+
+        assert _humanize_age(3600) == "1h"
+
+    def test_7200_seconds_is_2h(self) -> None:
+        from claude_visualizer.monitors.proxmox_cluster import _humanize_age
+
+        assert _humanize_age(7200) == "2h"
+
+
+# ---------------------------------------------------------------------------
+# TestNeverConnectedNoRed — never-connected monitor must NOT show red badge
+# ---------------------------------------------------------------------------
+
+
+class TestNeverConnectedNoRed:
+    """A monitor that has never received a successful snapshot must not show
+    PVE UNREACHABLE even after repeated failed polls.
+
+    The connecting… branch is reached before _fetch_failed is ever relevant
+    (snapshot is None → we return the connecting string, never render the bar).
+    """
+
+    def test_first_tick_shows_connecting_not_unreachable(self, tmp_path: Path) -> None:
+        """First tick with unreachable node → 'PVE: connecting…', no PVE UNREACHABLE."""
+        from claude_visualizer.monitors.proxmox_cluster import Monitor
+
+        m = Monitor(config_path=_write_yaml(tmp_path, _YAML_UNREACHABLE))
+        result = m.tick(1.0)
+        plain = result.plain if hasattr(result, "plain") else str(result)
+        assert (
+            "PVE UNREACHABLE" not in plain
+        ), f"Never-connected monitor must not show UNREACHABLE badge, got: {plain!r}"
+        assert "connecting" in plain.lower() or "PVE" in plain
+
+    def test_repeated_failed_ticks_never_show_red_badge(self, tmp_path: Path) -> None:
+        """Multiple ticks all failing → snapshot stays None → always connecting, never red."""
+        from claude_visualizer.monitors.proxmox_cluster import Monitor
+
+        m = Monitor(config_path=_write_yaml(tmp_path, _YAML_UNREACHABLE))
+        # Drive several ticks with _in_flight drained between them so each
+        # tick past the interval submits and collects a failed fetch.
+        now = 0.0
+        for step in [0.0, 35.0, 70.0, 105.0]:
+            now = step
+            m.tick(now)
+            # Drain: wait for in_flight if present so next tick can submit again.
+            if m._in_flight is not None:
+                try:
+                    m._in_flight.result(timeout=3.0)
+                except Exception:
+                    pass
+            result = m.tick(now)  # collect tick
+            plain = result.plain if hasattr(result, "plain") else str(result)
+            assert (
+                "PVE UNREACHABLE" not in plain
+            ), f"After {step}s never-connected: must not show UNREACHABLE, got: {plain!r}"
+            assert m._snapshot is None, "snapshot must stay None when never connected"
+
+
+# ---------------------------------------------------------------------------
+# TestConnectedThenFailedRedBadge — real HTTP server, success then failure
+# ---------------------------------------------------------------------------
+
+
+class TestConnectedThenFailedRedBadge:
+    """Real local HTTP server: serve valid data → collect success snapshot →
+    switch server to 500 → collect failure → assert bold-red badge with age.
+
+    Anti-mock: real http.server.HTTPServer on loopback, no unittest.mock.
+    """
+
+    def _make_server_and_monitor(
+        self,
+        tmp_path: Path,
+        *,
+        handler_class,  # type: ignore[type-arg]
+    ):
+        """Start a real HTTPServer on 127.0.0.1:0 and build a Monitor pointing at it."""
+        import threading
+        from http.server import HTTPServer
+
+        server = HTTPServer(("127.0.0.1", 0), handler_class)
+        port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+
+        node_url = f"http://127.0.0.1:{port}"
+        yaml_content = (
+            f"nodes:\n"
+            f"  - {node_url}\n"
+            f"token_id: root@pam!test\n"
+            f"token_secret: dummy\n"
+            f"poll_interval_seconds: 30\n"
+            f"alert_rotate_seconds: 10\n"
+            f"verify_ssl: false\n"
+        )
+        from claude_visualizer.monitors.proxmox_cluster import Monitor
+
+        cfg_path = _write_yaml(tmp_path, yaml_content)
+        m = Monitor(config_path=cfg_path)
+        return server, t, m
+
+    def test_red_badge_after_failure_with_deterministic_age(
+        self, tmp_path: Path
+    ) -> None:
+        """Serve OK → collect success (now=100) → shut server → collect failure (now=220).
+        Badge must: start with '⚠ PVE UNREACHABLE 2m', contain known node name,
+        and the badge span must be bold red.
+        """
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        from rich.console import Console
+
+        _OSD_TREE = {
+            "root": {
+                "type": None,
+                "name": None,
+                "children": [
+                    {
+                        "type": "root",
+                        "id": "-1",
+                        "name": "default",
+                        "children": [
+                            {
+                                "type": "host",
+                                "id": "-3",
+                                "name": "pve1",
+                                "children": [
+                                    {
+                                        "type": "osd",
+                                        "id": "0",
+                                        "name": "osd.0",
+                                        "status": "up",
+                                        "in": 1,
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        }
+
+        _GOOD_RESPONSES: dict = {
+            "/api2/json/cluster/status": [
+                {"type": "cluster", "name": "pve-test", "quorate": 1, "nodes": 1},
+                {
+                    "type": "node",
+                    "id": "node/pve99",
+                    "name": "pve99",
+                    "online": 1,
+                    "local": 1,
+                },
+            ],
+            "/api2/json/cluster/ceph/status": {
+                "health": {"status": "HEALTH_OK", "checks": {}},
+                "osdmap": {"num_osds": 1, "num_up_osds": 1, "num_in_osds": 1},
+                "pgmap": {
+                    "bytes_used": 100_000_000_000,
+                    "bytes_total": 1_000_000_000_000,
+                },
+            },
+            "/api2/json/cluster/ha/resources": [],
+            "/api2/json/nodes": [
+                {
+                    "node": "pve99",
+                    "status": "online",
+                    "cpu": 0.10,
+                    "mem": 2_000_000_000,
+                    "maxmem": 16_000_000_000,
+                },
+            ],
+            "/api2/json/nodes/pve99/ceph/osd": _OSD_TREE,
+        }
+
+        # Mutable container so the handler closure can switch modes.
+        state = {"fail": False}
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if state["fail"]:
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"server error")
+                    return
+                data = _GOOD_RESPONSES.get(self.path)
+                if data is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                body = json.dumps({"data": data}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), _Handler)
+        port = server.server_address[1]
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+
+        try:
+            from claude_visualizer.monitors.proxmox_cluster import Monitor
+
+            node_url = f"http://127.0.0.1:{port}"
+            yaml_content = (
+                f"nodes:\n"
+                f"  - {node_url}\n"
+                f"token_id: root@pam!test\n"
+                f"token_secret: dummy\n"
+                f"poll_interval_seconds: 30\n"
+                f"alert_rotate_seconds: 10\n"
+                f"verify_ssl: false\n"
+            )
+            cfg_path = _write_yaml(tmp_path, yaml_content)
+            m = Monitor(config_path=cfg_path)
+
+            # --- Step 1: submit a successful fetch at now=100 ---
+            m.tick(100.0)
+            in_flight = m._in_flight
+            assert in_flight is not None
+            result_snap = in_flight.result(timeout=5.0)
+            assert result_snap is not None, "_fetch must succeed against live server"
+
+            # Collect: tick at now=100 to store snapshot and record success time.
+            m.tick(100.0)
+            assert m._snapshot is not None, "snapshot must be populated after collect"
+            assert m._fetch_failed is False
+            assert m._last_success_at == pytest.approx(100.0)
+
+            # --- Step 2: switch server to 500, advance past poll interval ---
+            state["fail"] = True
+
+            # Advance to now=130 (> poll_interval=30) to trigger next poll.
+            m.tick(130.0)
+            fail_flight = m._in_flight
+            assert fail_flight is not None, "second poll must be submitted"
+            fail_result = fail_flight.result(timeout=5.0)
+            assert fail_result is None, "failed poll must return None"
+
+            # Collect at now=220: age = 220 - 100 = 120s = 2m
+            result = m.tick(220.0)
+
+            # --- Assertions on the rendered badge ---
+            assert hasattr(result, "plain"), f"Expected Text, got {type(result)}"
+            plain = result.plain
+            assert plain.startswith(
+                "⚠ PVE UNREACHABLE "
+            ), f"Badge must lead the bar, got: {plain!r}"
+            assert "2m" in plain, f"Age '2m' must appear in badge, got: {plain!r}"
+            assert (
+                "pve99" in plain
+            ), f"Known node name must appear in stale data, got: {plain!r}"
+
+            # Badge span must be styled bold red.
+            console = Console()
+            badge_style = str(result.get_style_at_offset(console, 0))
+            assert (
+                "bold" in badge_style.lower() and "red" in badge_style.lower()
+            ), f"Badge must be bold red, got style: {badge_style!r}"
+
+        finally:
+            server.shutdown()
+            server_thread.join(timeout=2.0)
+
+
+# ---------------------------------------------------------------------------
+# TestRecoveryAfterFailure — successful poll after failed state clears badge
+# ---------------------------------------------------------------------------
+
+
+class TestRecoveryAfterFailure:
+    """After _fetch_failed is True, a subsequent successful poll clears the flag
+    so tick() returns the normal bar without the ⚠ PVE UNREACHABLE badge.
+
+    Anti-mock: real HTTP server goes down then comes back up.
+    """
+
+    def test_recovery_clears_fetch_failed_flag(self, tmp_path: Path) -> None:
+        """Server OK → fail → OK again → badge disappears from rendered output."""
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        _OSD_TREE = {
+            "root": {
+                "type": None,
+                "name": None,
+                "children": [
+                    {
+                        "type": "root",
+                        "id": "-1",
+                        "name": "default",
+                        "children": [
+                            {
+                                "type": "host",
+                                "id": "-3",
+                                "name": "pve1",
+                                "children": [
+                                    {
+                                        "type": "osd",
+                                        "id": "0",
+                                        "name": "osd.0",
+                                        "status": "up",
+                                        "in": 1,
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        }
+
+        _GOOD_RESPONSES: dict = {
+            "/api2/json/cluster/status": [
+                {"type": "cluster", "name": "pve-test", "quorate": 1, "nodes": 1},
+                {
+                    "type": "node",
+                    "id": "node/pve88",
+                    "name": "pve88",
+                    "online": 1,
+                    "local": 1,
+                },
+            ],
+            "/api2/json/cluster/ceph/status": {
+                "health": {"status": "HEALTH_OK", "checks": {}},
+                "osdmap": {"num_osds": 1, "num_up_osds": 1, "num_in_osds": 1},
+                "pgmap": {
+                    "bytes_used": 50_000_000_000,
+                    "bytes_total": 1_000_000_000_000,
+                },
+            },
+            "/api2/json/cluster/ha/resources": [],
+            "/api2/json/nodes": [
+                {
+                    "node": "pve88",
+                    "status": "online",
+                    "cpu": 0.05,
+                    "mem": 1_000_000_000,
+                    "maxmem": 8_000_000_000,
+                },
+            ],
+            "/api2/json/nodes/pve88/ceph/osd": _OSD_TREE,
+        }
+
+        state = {"fail": False}
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if state["fail"]:
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"error")
+                    return
+                data = _GOOD_RESPONSES.get(self.path)
+                if data is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                body = json.dumps({"data": data}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), _Handler)
+        port = server.server_address[1]
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+
+        try:
+            from claude_visualizer.monitors.proxmox_cluster import Monitor
+
+            node_url = f"http://127.0.0.1:{port}"
+            yaml_content = (
+                f"nodes:\n"
+                f"  - {node_url}\n"
+                f"token_id: root@pam!test\n"
+                f"token_secret: dummy\n"
+                f"poll_interval_seconds: 30\n"
+                f"alert_rotate_seconds: 10\n"
+                f"verify_ssl: false\n"
+            )
+            cfg_path = _write_yaml(tmp_path, yaml_content)
+            m = Monitor(config_path=cfg_path)
+
+            # Step 1: successful poll at now=10
+            m.tick(10.0)
+            m._in_flight.result(timeout=5.0)
+            m.tick(10.0)  # collect
+            assert m._snapshot is not None
+            assert m._fetch_failed is False
+
+            # Step 2: fail poll at now=45
+            state["fail"] = True
+            m.tick(45.0)
+            m._in_flight.result(timeout=5.0)
+            m.tick(50.0)  # collect
+            assert m._fetch_failed is True
+
+            # Step 3: recover — server back online at now=80
+            state["fail"] = False
+            m.tick(80.0)
+            recovery_flight = m._in_flight
+            assert recovery_flight is not None
+            recovery_snap = recovery_flight.result(timeout=5.0)
+            assert recovery_snap is not None, "recovered fetch must succeed"
+
+            result = m.tick(80.0)  # collect
+            assert m._fetch_failed is False, "_fetch_failed must be cleared on recovery"
+            plain = result.plain if hasattr(result, "plain") else str(result)
+            assert (
+                "PVE UNREACHABLE" not in plain
+            ), f"After recovery badge must disappear, got: {plain!r}"
+
+        finally:
+            server.shutdown()
+            server_thread.join(timeout=2.0)
 
 
 class TestOsdEndpointFailure:

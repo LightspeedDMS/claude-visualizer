@@ -12,13 +12,14 @@ LIVE path  (cluster answers):
     Prints "LIVE cluster".
 
 DEGRADED path (cluster unreachable — user-approved fallback):
-    Exercises and asserts all three degraded Monitor states:
-      1. ``⚠ proxmox.yaml not found`` — Monitor instantiated with a missing
-         config_path (config absent).
+    Exercises and asserts all four degraded Monitor states:
+      1. Missing config → ``""`` (empty/suppressed — no row in the monitor bar).
       2. ``PVE: connecting…`` — config present but first poll returns None
          (nodes unreachable); snapshot is still None.
       3. Stale-snapshot retention — after one successful poll the snapshot is
          retained even when subsequent polls fail (all nodes unreachable).
+      4. Connected-then-500 — real local HTTP server serves OK then returns 500;
+         asserts the rendered bar shows ``⚠ PVE UNREACHABLE <age>`` badge.
     Prints "DEGRADED fallback (cluster unreachable)".
 
 Never prints the token_secret.  Always writes a real SVG screenshot.
@@ -30,9 +31,12 @@ Run headless:
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import tempfile
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from claude_visualizer.config import AppConfig
@@ -162,15 +166,15 @@ async def run_degraded(screenshot_path: Path, monitors_dir: Path) -> None:
     print("DEGRADED fallback (cluster unreachable) assertions:")
 
     # ------------------------------------------------------------------ #
-    # 1. Missing config → ⚠ proxmox.yaml not found
+    # 1. Missing config → "" (empty/suppressed — no row rendered)
     # ------------------------------------------------------------------ #
     missing_cfg = Path(tempfile.mkdtemp()) / "nonexistent.yaml"
     m_missing = Monitor(config_path=missing_cfg)
     result_missing = m_missing.tick(time.monotonic())
     text_missing = result_missing.plain if hasattr(result_missing, "plain") else str(result_missing)
     _check(
-        "proxmox.yaml not found" in text_missing or "⚠" in text_missing,
-        "missing config → ⚠ proxmox.yaml not found",
+        text_missing == "",
+        "missing config → '' (empty/suppressed, no row)",
         repr(text_missing),
     )
 
@@ -212,7 +216,153 @@ async def run_degraded(screenshot_path: Path, monitors_dir: Path) -> None:
         _check(m_stale._snapshot is None, "snapshot stays None on repeated failures")  # noqa: SLF001
 
     # ------------------------------------------------------------------ #
-    # Boot the real app with a missing-config wrapper so the bar shows ⚠.
+    # 4. Connected-then-500: real local HTTP server → success → 500 → badge
+    # ------------------------------------------------------------------ #
+    _OSD_TREE_E2E = {
+        "root": {
+            "type": None,
+            "name": None,
+            "children": [
+                {
+                    "type": "root",
+                    "id": "-1",
+                    "name": "default",
+                    "children": [
+                        {
+                            "type": "host",
+                            "id": "-3",
+                            "name": "e2enode",
+                            "children": [
+                                {
+                                    "type": "osd",
+                                    "id": "0",
+                                    "name": "osd.0",
+                                    "status": "up",
+                                    "in": 1,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+    }
+    _E2E_RESPONSES: dict = {
+        "/api2/json/cluster/status": [
+            {"type": "cluster", "name": "e2e-cluster", "quorate": 1, "nodes": 1},
+            {
+                "type": "node",
+                "id": "node/e2enode",
+                "name": "e2enode",
+                "online": 1,
+                "local": 1,
+            },
+        ],
+        "/api2/json/cluster/ceph/status": {
+            "health": {"status": "HEALTH_OK", "checks": {}},
+            "osdmap": {"num_osds": 1, "num_up_osds": 1, "num_in_osds": 1},
+            "pgmap": {
+                "bytes_used": 100_000_000_000,
+                "bytes_total": 1_000_000_000_000,
+            },
+        },
+        "/api2/json/cluster/ha/resources": [],
+        "/api2/json/nodes": [
+            {
+                "node": "e2enode",
+                "status": "online",
+                "cpu": 0.10,
+                "mem": 1_000_000_000,
+                "maxmem": 8_000_000_000,
+            },
+        ],
+        "/api2/json/nodes/e2enode/ceph/osd": _OSD_TREE_E2E,
+    }
+
+    e2e_state = {"fail": False}
+
+    class _E2EHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            if e2e_state["fail"]:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(b"error")
+                return
+            data = _E2E_RESPONSES.get(self.path)
+            if data is None:
+                self.send_response(404)
+                self.end_headers()
+                return
+            body = json.dumps({"data": data}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    e2e_server = HTTPServer(("127.0.0.1", 0), _E2EHandler)
+    e2e_port = e2e_server.server_address[1]
+    e2e_thread = threading.Thread(target=e2e_server.serve_forever, daemon=True)
+    e2e_thread.start()
+
+    try:
+        from claude_visualizer.monitors.proxmox_cluster import Monitor as _Mon
+
+        e2e_yaml = (
+            f"nodes:\n"
+            f"  - http://127.0.0.1:{e2e_port}\n"
+            f"token_id: root@pam!test\n"
+            f"token_secret: dummy\n"
+            f"poll_interval_seconds: 30\n"
+            f"alert_rotate_seconds: 10\n"
+            f"verify_ssl: false\n"
+        )
+        import tempfile as _tmp
+
+        e2e_cfg = Path(_tmp.mkdtemp()) / "e2e_proxmox.yaml"
+        e2e_cfg.write_text(e2e_yaml, encoding="utf-8")
+        m_e2e = _Mon(config_path=e2e_cfg)
+
+        # Step 4a: successful fetch at now=100
+        m_e2e.tick(100.0)
+        in_flight = m_e2e._in_flight  # noqa: SLF001
+        assert in_flight is not None, "Step 4: first poll must submit in_flight"
+        snap = in_flight.result(timeout=5.0)
+        assert snap is not None, "Step 4: first fetch must succeed against live server"
+        m_e2e.tick(100.0)  # collect
+        assert m_e2e._snapshot is not None  # noqa: SLF001
+
+        # Step 4b: switch server to 500, advance past poll_interval
+        e2e_state["fail"] = True
+        m_e2e.tick(130.0)  # submit failing poll
+        fail_flight = m_e2e._in_flight  # noqa: SLF001
+        assert fail_flight is not None, "Step 4: second poll must submit in_flight"
+        fail_snap = fail_flight.result(timeout=5.0)
+        assert fail_snap is None, "Step 4: failed poll must return None"
+
+        # Collect at now=220 → age = 120s = 2m
+        result_e2e = m_e2e.tick(220.0)
+        text_e2e = result_e2e.plain if hasattr(result_e2e, "plain") else str(result_e2e)
+        _check(
+            "PVE UNREACHABLE" in text_e2e,
+            "connected-then-500 → ⚠ PVE UNREACHABLE badge present",
+            repr(text_e2e[:120]),
+        )
+        _check(
+            "e2enode" in text_e2e,
+            "stale node name preserved in badge bar",
+            repr(text_e2e[:120]),
+        )
+        print(f"\n  [INFO] connected-then-500 bar: {text_e2e[:120]}")
+    finally:
+        e2e_server.shutdown()
+        e2e_thread.join(timeout=2.0)
+
+    # ------------------------------------------------------------------ #
+    # Boot the real app with a missing-config wrapper so the bar is empty.
     # ------------------------------------------------------------------ #
     projects_root = Path(tempfile.mkdtemp(prefix="cv-e2e-pve-deg-")) / "projects"
     projects_root.mkdir(parents=True, exist_ok=True)
@@ -237,11 +387,14 @@ async def run_degraded(screenshot_path: Path, monitors_dir: Path) -> None:
 
     async with app.run_test(size=(200, 40)) as pilot:
         bar = pilot.app.query_one(MonitorBar)
-        text = await _pump(bar, "proxmox", pilot, tries=60)
+        # With missing config the monitor returns "" — the bar is suppressed
+        # (no Proxmox row rendered).  Settle briefly then check the bar is empty.
+        await _settle(pilot, 30)
+        text = bar.rendered_text()
 
         _check(
-            "proxmox.yaml not found" in text or "⚠" in text,
-            "app renders ⚠ proxmox.yaml not found for missing config",
+            "proxmox.yaml not found" not in text and "⚠" not in text,
+            "app renders no Proxmox row for missing config (suppressed)",
             repr(text[:120]),
         )
 
@@ -253,8 +406,8 @@ async def run_degraded(screenshot_path: Path, monitors_dir: Path) -> None:
             f"path={screenshot_path}",
         )
 
-        print("\n--- Proxmox monitor bar (DEGRADED) ---")
-        print(text[:200])
+        print("\n--- Proxmox monitor bar (DEGRADED — suppressed) ---")
+        print(repr(text[:200]))
 
     print(f"\nDEGRADED fallback (cluster unreachable). Screenshot: {screenshot_path}")
 

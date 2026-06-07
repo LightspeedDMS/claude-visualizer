@@ -316,14 +316,37 @@ _COLOUR_FOR_ALERT_SEV: Dict[Severity, str] = {
 }
 
 
-def render_proxmox_bar(snapshot: ProxmoxSnapshot, alert_index: int) -> Text:
+def _humanize_age(seconds: float) -> str:
+    """Convert an age in seconds to a human-readable string: Ns, Nm, or Nh."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    return f"{s // 3600}h"
+
+
+def render_proxmox_bar(
+    snapshot: ProxmoxSnapshot,
+    alert_index: int,
+    *,
+    stale_for: Optional[float] = None,
+) -> Text:
     """Render the one-line Proxmox cluster status bar as a Rich ``Text``.
 
     Layout:
-        Cluster: OK/WARN/ERR │ Ceph: HEALTH_OK/WARN/ERR │ <id>● per node │
-        ● per OSD (id asc) osds │ ↻ ⚑ <alert>
+        [⚠ PVE UNREACHABLE <age> │ ] Cluster: OK/WARN/ERR │ Ceph: … │
+        <id>● per node │ ● per OSD (id asc) osds │ ↻ ⚑ <alert>
+
+    ``stale_for``: when not None, prepend a bold-red unreachable badge followed
+    by the last-known cluster data (stale snapshot retained per AC2).
     """
     out = Text(no_wrap=True, overflow="ellipsis")
+
+    # --- Unreachable badge (when fetch has failed after a prior success) ----
+    if stale_for is not None:
+        out.append(f"⚠ PVE UNREACHABLE {_humanize_age(stale_for)}", style="bold red")
+        out.append(" │", style="dim")
 
     # --- Cluster verdict (Defect 4: quorum-based, not node-offline-based) ----
     # Proxmox shows cluster GREEN when quorate, even with a node down.
@@ -452,6 +475,8 @@ class Monitor:
         self._polled_once: bool = False
         self._alert_index: int = 0
         self._last_rotate: float = 0.0
+        self._fetch_failed: bool = False
+        self._last_success_at: float = 0.0
         self._in_flight: Optional[
             concurrent.futures.Future[Optional[ProxmoxSnapshot]]
         ] = None
@@ -498,9 +523,7 @@ class Monitor:
           - Rendered bar from current snapshot otherwise.
         """
         if self._config is None:
-            msg = Text()
-            msg.append("⚠ proxmox.yaml not found", style="dim")
-            return msg
+            return ""  # no proxmox.yaml → suppress the monitor entirely (no row)
 
         cfg = self._config
 
@@ -510,8 +533,12 @@ class Monitor:
                 fresh = self._in_flight.result()
                 if fresh is not None:
                     self._snapshot = fresh
+                    self._last_success_at = now
+                    self._fetch_failed = False
+                else:
+                    self._fetch_failed = True  # all nodes failed → keep stale snapshot
             except Exception:
-                pass  # fetch raised — keep stale snapshot
+                self._fetch_failed = True  # fetch raised → keep stale snapshot
             self._in_flight = None
 
         # --- Submit a new fetch if due and none in-flight --------------------
@@ -532,6 +559,10 @@ class Monitor:
             self._alert_index = (self._alert_index + 1) % len(alerts)
             self._last_rotate = now
 
+        if self._fetch_failed:
+            return render_proxmox_bar(
+                self._snapshot, self._alert_index, stale_for=now - self._last_success_at
+            )
         return render_proxmox_bar(self._snapshot, self._alert_index)
 
     def _fetch(self) -> Optional[ProxmoxSnapshot]:

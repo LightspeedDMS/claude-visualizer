@@ -94,9 +94,21 @@ Routing is by event type: `FileModifiedEvent` → MRU + diff queue; `CommandEven
   `~/.claude-visualizer/proxmox.yaml` (PyYAML) into a `ProxmoxConfig`
   dataclass (`nodes`, `token_id`, `token_secret`, `poll_interval_seconds=30`,
   `alert_rotate_seconds=10`, `verify_ssl=False`); a missing file sets
-  `_config=None`. `tick(now)` returns `"⚠ proxmox.yaml not found"` when config
-  is absent, `"PVE: connecting…"` while the first poll is still pending, or a
-  Rich `Text` bar from `render_proxmox_bar(snapshot, alert_index)`. Poll is
+  `_config=None`. **Degraded states** (three tiers, no fabrication):
+  1. **No config** — `_config is None` → `tick()` returns `""` (empty string);
+     `MonitorBar` suppresses the row entirely (no warning line shown).
+  2. **Never connected** — config present but `_snapshot is None` (first poll
+     still pending or all nodes unreachable since startup) → `"PVE: connecting…"`.
+     `_fetch_failed` stays `False` here; no red badge is shown.
+  3. **Fetch failure after success** — `_snapshot` is populated from a prior
+     successful fetch but the latest poll returned `None` or raised → `_fetch_failed`
+     set `True`; `tick()` calls `render_proxmox_bar(snapshot, alert_index,
+     stale_for=now - _last_success_at)` which prepends a `bold red` badge
+     `⚠ PVE UNREACHABLE <age>` (age via `_humanize_age`: Ns/Nm/Nh) followed by
+     the last-known cluster bar. On the next successful fetch `_fetch_failed` is
+     cleared and `_last_success_at` updated → badge disappears.
+  `tick(now)` returns a Rich `Text` bar from `render_proxmox_bar(snapshot,
+  alert_index[, stale_for=…])`. Poll is
   throttled by two fields: `_polled_once: bool` (False until the first real
   poll completes) and `_last_poll: float` (monotonic time of last poll). Guard
   is `not _polled_once OR now - _last_poll >= poll_interval_seconds` — using a
@@ -327,12 +339,16 @@ PRECEDES the `tool_use` entry but shares the same **entry-level** `requestId`
   (**LIVE path**) it asserts the rendered `MonitorBar` line contains `Cluster:`,
   `Ceph:`, at least one `●` node/OSD dot, and an alert section (`↻`/`⚑`/`no
   alerts`). If the cluster is unreachable (**DEGRADED path**, user-approved
-  fallback), it deterministically exercises all three degraded Monitor states
-  without fabricating data: `⚠ proxmox.yaml not found` (missing config),
-  `PVE: connecting…` (config present, first poll fails), and stale-snapshot
-  retention (snapshot stays `None` across repeated failed polls); also boots the
-  real app with a missing-config wrapper and asserts the bar renders the `⚠`
-  warning. Never prints the `token_secret`. Always writes a real SVG.
+  fallback), it deterministically exercises all four degraded Monitor states
+  without fabricating data:
+  (1) missing config → `""` (empty/suppressed, no row rendered);
+  (2) `PVE: connecting…` (config present, first poll fails, `_snapshot` still `None`);
+  (3) stale-snapshot retention (`_snapshot` stays `None` across repeated failed polls);
+  (4) connected-then-500 — real `http.server.HTTPServer` on loopback serves valid
+  Proxmox JSON then switches to HTTP 500; asserts the rendered bar starts with
+  `⚠ PVE UNREACHABLE <age>` (bold-red badge) and still contains the last-known
+  node name.  Also boots the real app with a missing-config wrapper and asserts
+  the bar is empty (no Proxmox row). Never prints the `token_secret`. Always writes a real SVG.
   Run: `TEXTUAL=headless .venv/bin/python scripts/e2e_proxmox_monitor_live.py out.svg`.
   Full-screen boot of the installed binary against a fixture:
   `TEXTUAL=headless timeout 5 .venv/bin/claude-visualizer --projects-root <fixture>`
