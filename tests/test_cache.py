@@ -270,12 +270,15 @@ class TestCorruptRowSkipped:
 
 class TestCacheDisabledWhenPathNone:
     async def test_cache_disabled_when_path_none(self, tmp_path: Path):
+        monitors_empty = tmp_path / "monitors_empty"
+        monitors_empty.mkdir(parents=True, exist_ok=True)
         cfg = AppConfig(
             projects_root=tmp_path / "projects",
             active_window_seconds=3600,
             discovery_interval_seconds=0.05,
             poll_interval_seconds=0.05,
             cache_path=None,
+            monitors_dir=monitors_empty,  # tests must not touch ~/.claude-visualizer/monitors/
         )
         app = VisualizerApp(cfg)
         async with app.run_test() as pilot:

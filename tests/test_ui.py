@@ -19,6 +19,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from claude_visualizer.config import AppConfig
 from claude_visualizer.events import CommandEvent, FileOp
 from claude_visualizer.models.command_feed import CommandFeedEntry, CommandFeedModel
@@ -119,6 +121,11 @@ def _append_line(path: Path, line: str) -> None:
 
 
 def _fixture_config(root: Path, **overrides) -> AppConfig:
+    # Default monitors_dir to an empty controlled directory so VisualizerApp
+    # boots load ZERO real monitors (no proxmox_cluster.py, no zzz_machine_stats.py).
+    # Callers may override via monitors_dir=<path> in overrides.
+    monitors_empty = root.parent / "monitors_empty"
+    monitors_empty.mkdir(parents=True, exist_ok=True)
     base = dict(
         projects_root=root,
         active_window_seconds=3600,
@@ -128,6 +135,7 @@ def _fixture_config(root: Path, **overrides) -> AppConfig:
         max_line_bytes=1_000_000,
         mru_max=50,
         cache_path=None,  # tests must not touch ~/.claude-visualizer/cache.db
+        monitors_dir=monitors_empty,  # tests must not touch ~/.claude-visualizer/monitors/
     )
     base.update(overrides)
     return AppConfig(**base)
@@ -1603,3 +1611,100 @@ class TestMonitorBarWidget:
         bar = MonitorBar()
         bar.update_from_lines([])
         assert bar.display is False
+
+
+# ---------------------------------------------------------------------------
+# Regression: _fixture_config must not point at the real monitors directory
+# ---------------------------------------------------------------------------
+
+
+class TestFixtureConfigMonitorsDir:
+    """Prove _fixture_config isolates monitor loading from the real user dir.
+
+    The offender: _fixture_config used to omit monitors_dir, defaulting to
+    ~/.claude-visualizer/monitors/.  Any VisualizerApp booted from such a
+    config called MonitorRegistry.load() on the REAL seeded monitors (including
+    proxmox_cluster.py), which then polled the live Proxmox cluster.
+
+    Invariants asserted here:
+    - _fixture_config().monitors_dir is NOT the real ~/.claude-visualizer/monitors/
+    - A MonitorRegistry built from _fixture_config() loads ZERO monitors.
+    """
+
+    def test_fixture_config_monitors_dir_is_not_real_user_dir(
+        self, tmp_path: Path
+    ) -> None:
+        """_fixture_config must point monitors_dir at a controlled dir, not the real one."""
+        from claude_visualizer.models.monitor_registry import (
+            MonitorRegistry,  # noqa: F401
+        )
+
+        real_user_monitors = Path.home() / ".claude-visualizer" / "monitors"
+        cfg = _fixture_config(tmp_path / "projects")
+        assert cfg.monitors_dir != real_user_monitors, (
+            f"_fixture_config().monitors_dir must NOT be the real user monitors dir "
+            f"{real_user_monitors!r}; got {cfg.monitors_dir!r}"
+        )
+
+    def test_fixture_config_loads_zero_monitors(self, tmp_path: Path) -> None:
+        """MonitorRegistry built from _fixture_config must load ZERO monitors."""
+        from claude_visualizer.models.monitor_registry import MonitorRegistry
+
+        cfg = _fixture_config(tmp_path / "projects")
+        registry = MonitorRegistry(cfg)
+        registry.load()
+        lines = registry.tick(0.0)
+        assert lines == [], (
+            f"Expected MonitorRegistry from _fixture_config to load 0 monitors; "
+            f"got {len(lines)} line(s): {lines!r}. "
+            f"monitors_dir was: {cfg.monitors_dir!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regression: network guard raises on non-loopback, allows loopback
+# ---------------------------------------------------------------------------
+
+
+class TestNetworkGuard:
+    """Prove the conftest network guard works correctly.
+
+    The autouse ``_block_live_network`` fixture patches socket.connect so any
+    non-loopback AF_INET/AF_INET6 connect raises RuntimeError.  These tests
+    verify both sides of that guard: blocked (non-loopback) and allowed
+    (loopback classification logic).
+    """
+
+    def test_guard_raises_on_non_loopback_connect(self) -> None:
+        """A non-loopback AF_INET connect must raise RuntimeError from the guard."""
+        import socket as _socket
+
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        try:
+            with pytest.raises(RuntimeError, match="live network connection"):
+                # 192.0.2.1 is TEST-NET-1 (RFC 5737) — documentation-only,
+                # guaranteed unreachable, but the guard fires BEFORE the kernel
+                # even tries to connect.
+                sock.connect(("192.0.2.1", 80))
+        finally:
+            sock.close()
+
+    def test_guard_is_loopback_helper_classifies_correctly(self) -> None:
+        """_is_loopback correctly identifies loopback vs non-loopback addresses."""
+        from tests.conftest import _is_loopback
+
+        # Loopback — must return True.
+        assert _is_loopback(("127.0.0.1", 8080)) is True
+        assert _is_loopback(("127.0.0.2", 1234)) is True  # full 127.x.x.x range
+        assert _is_loopback(("::1", 80)) is True
+        assert _is_loopback(("localhost", 80)) is True
+
+        # Non-loopback — must return False.
+        assert _is_loopback(("192.168.68.15", 8006)) is False  # Proxmox cluster
+        assert _is_loopback(("192.0.2.1", 80)) is False  # TEST-NET-1
+        assert _is_loopback(("8.8.8.8", 53)) is False
+        assert _is_loopback(("10.0.0.1", 22)) is False
+
+        # Non-tuple inputs — must return False safely (no crash).
+        assert _is_loopback("/tmp/sock") is False  # AF_UNIX path string
+        assert _is_loopback(None) is False
