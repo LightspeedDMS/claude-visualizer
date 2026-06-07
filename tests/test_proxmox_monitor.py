@@ -130,6 +130,7 @@ def _make_snapshot(
     ceph_used_pct: float = 0.10,
     alerts: Optional[List] = None,
     fetched_at: float = 0.0,
+    quorate: bool = True,
 ):
     from claude_visualizer.monitors.proxmox_cluster import (
         NodeState,
@@ -150,6 +151,7 @@ def _make_snapshot(
         ceph_used_pct=ceph_used_pct,
         alerts=alerts,
         fetched_at=fetched_at,
+        quorate=quorate,
     )
 
 
@@ -733,6 +735,91 @@ class TestEmptyAlertsText:
 class TestParseIntegration:
     """Drive _parse with real Proxmox-API-shaped dicts."""
 
+    # OSD tree with 3 OSDs (ids 0, 1, 2) for integration tests that assert OSD count.
+    _OSD_TREE_3: dict = {
+        "flags": "",
+        "root": {
+            "type": None,
+            "name": None,
+            "children": [
+                {
+                    "type": "root",
+                    "id": "-1",
+                    "name": "default",
+                    "children": [
+                        {
+                            "type": "host",
+                            "id": "-3",
+                            "name": "pve1",
+                            "children": [
+                                {
+                                    "type": "osd",
+                                    "id": "0",
+                                    "name": "osd.0",
+                                    "status": "up",
+                                    "in": 1,
+                                },
+                                {
+                                    "type": "osd",
+                                    "id": "1",
+                                    "name": "osd.1",
+                                    "status": "up",
+                                    "in": 1,
+                                },
+                                {
+                                    "type": "osd",
+                                    "id": "2",
+                                    "name": "osd.2",
+                                    "status": "up",
+                                    "in": 1,
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+
+    # OSD tree with 2 OSDs: id=0 up, id=1 down.
+    _OSD_TREE_WITH_DOWN: dict = {
+        "flags": "",
+        "root": {
+            "type": None,
+            "name": None,
+            "children": [
+                {
+                    "type": "root",
+                    "id": "-1",
+                    "name": "default",
+                    "children": [
+                        {
+                            "type": "host",
+                            "id": "-3",
+                            "name": "pve1",
+                            "children": [
+                                {
+                                    "type": "osd",
+                                    "id": "0",
+                                    "name": "osd.0",
+                                    "status": "up",
+                                    "in": 1,
+                                },
+                                {
+                                    "type": "osd",
+                                    "id": "1",
+                                    "name": "osd.1",
+                                    "status": "down",
+                                    "in": 1,
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+
     def test_parse_healthy_cluster(self) -> None:
         from claude_visualizer.monitors.proxmox_cluster import Monitor
 
@@ -742,6 +829,7 @@ class TestParseIntegration:
             ceph_status=_CEPH_STATUS_OK,
             ha_resources=_HA_RESOURCES_OK,
             nodes=_NODES_OK,
+            osd_tree=self._OSD_TREE_3,
         )
         assert snap is not None
         assert len(snap.nodes) == 2
@@ -760,6 +848,7 @@ class TestParseIntegration:
             ceph_status=_CEPH_STATUS_DEGRADED,
             ha_resources=_HA_RESOURCES_OK,
             nodes=_NODES_OK,
+            osd_tree=None,
         )
         assert snap is not None
         assert snap.ceph_status == "HEALTH_WARN"
@@ -774,6 +863,7 @@ class TestParseIntegration:
             ceph_status=_CEPH_STATUS_OK,
             ha_resources=_HA_RESOURCES_ERROR,
             nodes=_NODES_OK,
+            osd_tree=None,
         )
         assert snap is not None
         assert any(a.severity == Severity.CRIT for a in snap.alerts)
@@ -781,19 +871,13 @@ class TestParseIntegration:
     def test_parse_osd_down(self) -> None:
         from claude_visualizer.monitors.proxmox_cluster import Monitor
 
-        ceph_with_down = {
-            **_CEPH_STATUS_OK,
-            "osdmap": {
-                "osdmap": {"num_osds": 2, "num_up_osds": 1, "num_in_osds": 2},
-                "osds": [{"osd": 0, "up": 1, "in": 1}, {"osd": 1, "up": 0, "in": 1}],
-            },
-        }
         m = Monitor.__new__(Monitor)
         snap = m._parse(
             cluster_status=_CLUSTER_STATUS_OK,
-            ceph_status=ceph_with_down,
+            ceph_status=_CEPH_STATUS_OK,
             ha_resources=_HA_RESOURCES_OK,
             nodes=_NODES_OK,
+            osd_tree=self._OSD_TREE_WITH_DOWN,
         )
         assert snap is not None
         osd1 = next(o for o in snap.osds if o.id == 1)
@@ -968,6 +1052,7 @@ class TestN2MalformedNodeFailover:
                         ceph_status={},  # 'health'/'osdmap' missing
                         ha_resources=[],
                         nodes=[{"MISSING_KEY": True}],  # 'node' key missing
+                        osd_tree=None,
                     )
                     results.append("parsed_ok")
                 except (KeyError, ValueError, TypeError):
@@ -1015,7 +1100,45 @@ class TestRealHttpServerFetch:
         import threading
         from http.server import BaseHTTPRequestHandler, HTTPServer
 
-        # Real Proxmox-API-shaped responses for the four endpoints.
+        # Real Proxmox-API-shaped responses for all five endpoints (Bug #8).
+        # /nodes/pve1/ceph/osd: CRUSH tree with OSD 1 down — asserted below.
+        _OSD_TREE_HTTP: dict = {
+            "flags": "sortbitwise",
+            "root": {
+                "type": None,
+                "name": None,
+                "children": [
+                    {
+                        "type": "root",
+                        "id": "-1",
+                        "name": "default",
+                        "children": [
+                            {
+                                "type": "host",
+                                "id": "-3",
+                                "name": "pve1",
+                                "children": [
+                                    {
+                                        "type": "osd",
+                                        "id": "0",
+                                        "name": "osd.0",
+                                        "status": "up",
+                                        "in": 1,
+                                    },
+                                    {
+                                        "type": "osd",
+                                        "id": "1",
+                                        "name": "osd.1",
+                                        "status": "down",  # OSD 1 down — asserted
+                                        "in": 1,
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            },
+        }
         _RESPONSES: dict = {
             "/api2/json/cluster/status": [
                 {"type": "cluster", "name": "pve-test", "quorate": 1, "nodes": 1},
@@ -1029,12 +1152,11 @@ class TestRealHttpServerFetch:
             ],
             "/api2/json/cluster/ceph/status": {
                 "health": {"status": "HEALTH_OK", "checks": {}},
+                # osdmap has NO 'osds' key — matches real Proxmox shape (Bug #8)
                 "osdmap": {
-                    "osdmap": {"num_osds": 2, "num_up_osds": 2, "num_in_osds": 2},
-                    "osds": [
-                        {"osd": 0, "up": 1, "in": 1},
-                        {"osd": 1, "up": 0, "in": 1},  # OSD 1 down — asserted below
-                    ],
+                    "num_osds": 2,
+                    "num_up_osds": 1,
+                    "num_in_osds": 2,
                 },
                 "pgmap": {
                     "bytes_used": 200_000_000_000,
@@ -1053,6 +1175,7 @@ class TestRealHttpServerFetch:
                     "maxmem": 16_000_000_000,
                 },
             ],
+            "/api2/json/nodes/pve1/ceph/osd": _OSD_TREE_HTTP,
         }
 
         class _Handler(BaseHTTPRequestHandler):
@@ -1129,6 +1252,800 @@ class TestRealHttpServerFetch:
 
             assert snap.ceph_status == "HEALTH_OK"
             assert snap.ceph_used_pct == pytest.approx(0.20)
+
+        finally:
+            server.shutdown()
+            server_thread.join(timeout=2.0)
+
+
+# ---------------------------------------------------------------------------
+# Bug #8 — Defect 1: OSD data from CRUSH tree (not osdmap.osds)
+# ---------------------------------------------------------------------------
+
+# Real CRUSH tree shape as returned by /nodes/{node}/ceph/osd
+_OSD_TREE_RESPONSE: dict = {
+    "flags": "sortbitwise,recovery_deletes",
+    "root": {
+        "type": None,
+        "name": None,
+        "children": [
+            {
+                "type": "root",
+                "id": "-1",
+                "name": "default",
+                "children": [
+                    {
+                        "type": "host",
+                        "id": "-3",
+                        "name": "pve1",
+                        "children": [
+                            {
+                                "type": "osd",
+                                "id": "0",
+                                "name": "osd.0",
+                                "status": "up",
+                                "in": 1,
+                                "device_class": "ssd",
+                            },
+                            {
+                                "type": "osd",
+                                "id": "2",
+                                "name": "osd.2",
+                                "status": "down",  # one OSD down
+                                "in": 1,
+                                "device_class": "ssd",
+                            },
+                        ],
+                    },
+                    {
+                        "type": "host",
+                        "id": "-5",
+                        "name": "pve2",
+                        "children": [
+                            {
+                                "type": "osd",
+                                "id": "1",
+                                "name": "osd.1",
+                                "status": "up",
+                                "in": 1,
+                                "device_class": "ssd",
+                            },
+                        ],
+                    },
+                ],
+            }
+        ],
+    },
+}
+
+
+class TestOsdCrushTree:
+    """Bug #8 Defect 1: OSD data must come from CRUSH tree (nodes/{node}/ceph/osd),
+    not from osdmap.osds (which is null on real Proxmox).
+    """
+
+    def test_parse_osds_from_crush_tree(self, tmp_path: Path) -> None:
+        """_parse with osd_tree argument populates OSDs correctly from CRUSH tree."""
+        from claude_visualizer.monitors.proxmox_cluster import Monitor
+
+        m = Monitor.__new__(Monitor)
+        snap = m._parse(
+            cluster_status=_CLUSTER_STATUS_OK,
+            ceph_status=_CEPH_STATUS_OK,
+            ha_resources=_HA_RESOURCES_OK,
+            nodes=_NODES_OK,
+            osd_tree=_OSD_TREE_RESPONSE,
+        )
+        assert snap is not None
+        # Must have 3 OSDs (id 0, 1, 2) from the tree
+        assert len(snap.osds) == 3
+        ids = sorted(o.id for o in snap.osds)
+        assert ids == [0, 1, 2]
+
+    def test_osd_down_reflected_from_crush_tree(self, tmp_path: Path) -> None:
+        """OSD 2 has status='down' in tree — must be reflected in snapshot."""
+        from claude_visualizer.monitors.proxmox_cluster import Monitor
+
+        m = Monitor.__new__(Monitor)
+        snap = m._parse(
+            cluster_status=_CLUSTER_STATUS_OK,
+            ceph_status=_CEPH_STATUS_OK,
+            ha_resources=_HA_RESOURCES_OK,
+            nodes=_NODES_OK,
+            osd_tree=_OSD_TREE_RESPONSE,
+        )
+        osd2 = next(o for o in snap.osds if o.id == 2)
+        assert osd2.up is False, "OSD 2 is 'down' in tree — must be up=False"
+        osd0 = next(o for o in snap.osds if o.id == 0)
+        assert osd0.up is True
+
+    def test_osdmap_null_osds_falls_back_to_tree(self) -> None:
+        """When osdmap has no 'osds' key (null on real Proxmox), OSD tree is used."""
+        from claude_visualizer.monitors.proxmox_cluster import Monitor
+
+        ceph_no_osd_list = {
+            "health": {"status": "HEALTH_OK", "checks": {}},
+            "osdmap": {
+                "num_osds": 3,
+                "num_up_osds": 2,
+                "num_in_osds": 3,
+            },
+            "pgmap": {"bytes_used": 100_000_000_000, "bytes_total": 1_000_000_000_000},
+        }
+        m = Monitor.__new__(Monitor)
+        snap = m._parse(
+            cluster_status=_CLUSTER_STATUS_OK,
+            ceph_status=ceph_no_osd_list,
+            ha_resources=_HA_RESOURCES_OK,
+            nodes=_NODES_OK,
+            osd_tree=_OSD_TREE_RESPONSE,
+        )
+        # OSDs come from tree, not from null osdmap.osds
+        assert len(snap.osds) == 3
+
+    def test_real_http_server_serves_osd_tree_and_populates_snapshot(
+        self, tmp_path: Path
+    ) -> None:
+        """Real HTTP server: serves /nodes/pve1/ceph/osd with CRUSH tree.
+        Background fetch populates _snapshot with OSDs from tree."""
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        _RESPONSES: dict = {
+            "/api2/json/cluster/status": [
+                {"type": "cluster", "name": "pve-test", "quorate": 1, "nodes": 1},
+                {
+                    "type": "node",
+                    "id": "node/pve1",
+                    "name": "pve1",
+                    "online": 1,
+                    "local": 1,
+                },
+            ],
+            "/api2/json/cluster/ceph/status": {
+                "health": {"status": "HEALTH_OK", "checks": {}},
+                # osdmap has NO 'osds' key — real Proxmox shape
+                "osdmap": {
+                    "num_osds": 3,
+                    "num_up_osds": 2,
+                    "num_in_osds": 3,
+                },
+                "pgmap": {
+                    "bytes_used": 200_000_000_000,
+                    "bytes_total": 1_000_000_000_000,
+                },
+            },
+            "/api2/json/cluster/ha/resources": [
+                {"sid": "vm:200", "state": "started", "type": "vm"},
+            ],
+            "/api2/json/nodes": [
+                {
+                    "node": "pve1",
+                    "status": "online",
+                    "cpu": 0.45,
+                    "mem": 6_000_000_000,
+                    "maxmem": 16_000_000_000,
+                },
+            ],
+            "/api2/json/nodes/pve1/ceph/osd": _OSD_TREE_RESPONSE,
+        }
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                data = _RESPONSES.get(self.path)
+                if data is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                body = json.dumps({"data": data}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), _Handler)
+        port = server.server_address[1]
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+
+        try:
+            node_url = f"http://127.0.0.1:{port}"
+            yaml_content = (
+                f"nodes:\n"
+                f"  - {node_url}\n"
+                f"token_id: root@pam!test\n"
+                f"token_secret: dummy\n"
+                f"poll_interval_seconds: 30\n"
+                f"alert_rotate_seconds: 10\n"
+                f"verify_ssl: false\n"
+            )
+            cfg_path = _write_yaml(tmp_path, yaml_content)
+
+            from claude_visualizer.monitors.proxmox_cluster import Monitor
+
+            m = Monitor(config_path=cfg_path)
+            m.tick(0.0)
+            in_flight = m._in_flight
+            assert in_flight is not None
+
+            result = in_flight.result(timeout=5.0)
+            assert result is not None, "_fetch must succeed against real HTTP server"
+
+            m.tick(0.0)  # collect result
+            snap = m._snapshot
+            assert snap is not None
+
+            # OSDs come from CRUSH tree (3 nodes: id 0, 1, 2)
+            assert (
+                len(snap.osds) == 3
+            ), f"expected 3 OSDs from tree, got {len(snap.osds)}"
+            ids = sorted(o.id for o in snap.osds)
+            assert ids == [0, 1, 2]
+            osd2 = next(o for o in snap.osds if o.id == 2)
+            assert osd2.up is False, "OSD 2 marked down in tree — must be up=False"
+
+        finally:
+            server.shutdown()
+            server_thread.join(timeout=2.0)
+
+
+# ---------------------------------------------------------------------------
+# Bug #8 — Defect 2: Node dots sorted alphabetically by name
+# ---------------------------------------------------------------------------
+
+
+class TestNodeAlphabeticalSort:
+    """Bug #8 Defect 2: nodes in _parse output and render must be sorted by name."""
+
+    def test_parse_sorts_nodes_alphabetically(self) -> None:
+        """_parse returns nodes sorted by name ascending, regardless of API order."""
+        from claude_visualizer.monitors.proxmox_cluster import Monitor
+
+        # API returns nodes in scrambled order (matches real /cluster/status)
+        scrambled_cluster_status = [
+            {"type": "cluster", "name": "pve-cluster", "quorate": 1, "nodes": 5},
+            {"type": "node", "id": "node/pve18", "name": "pve18", "online": 1},
+            {"type": "node", "id": "node/pve19", "name": "pve19", "online": 0},
+            {"type": "node", "id": "node/pve17", "name": "pve17", "online": 1},
+            {"type": "node", "id": "node/pve16", "name": "pve16", "online": 1},
+            {"type": "node", "id": "node/pve15", "name": "pve15", "online": 1},
+        ]
+        m = Monitor.__new__(Monitor)
+        snap = m._parse(
+            cluster_status=scrambled_cluster_status,
+            ceph_status=_CEPH_STATUS_OK,
+            ha_resources=_HA_RESOURCES_OK,
+            nodes=[],
+            osd_tree=None,
+        )
+        names = [n.name for n in snap.nodes]
+        assert names == sorted(names), f"nodes not sorted: {names}"
+        assert names == ["pve15", "pve16", "pve17", "pve18", "pve19"]
+
+    def test_parse_offline_node_correct_position_after_sort(self) -> None:
+        """After alphabetical sort pve19 (offline) is the last node."""
+        from claude_visualizer.monitors.proxmox_cluster import Monitor
+
+        scrambled = [
+            {"type": "cluster", "name": "pve-cluster", "quorate": 1, "nodes": 5},
+            {"type": "node", "id": "node/pve18", "name": "pve18", "online": 1},
+            {"type": "node", "id": "node/pve19", "name": "pve19", "online": 0},
+            {"type": "node", "id": "node/pve17", "name": "pve17", "online": 1},
+            {"type": "node", "id": "node/pve16", "name": "pve16", "online": 1},
+            {"type": "node", "id": "node/pve15", "name": "pve15", "online": 1},
+        ]
+        m = Monitor.__new__(Monitor)
+        snap = m._parse(
+            cluster_status=scrambled,
+            ceph_status=_CEPH_STATUS_OK,
+            ha_resources=_HA_RESOURCES_OK,
+            nodes=[],
+            osd_tree=None,
+        )
+        assert snap.nodes[-1].name == "pve19"
+        assert snap.nodes[-1].online is False
+
+    def test_render_bar_shows_nodes_in_alphabetical_order(self) -> None:
+        """render_proxmox_bar renders nodes in the order they appear in the snapshot.
+        _parse sorts alphabetically; this test confirms the render preserves that order
+        by passing an already-sorted snapshot (as _parse would produce).
+        """
+        from claude_visualizer.monitors.proxmox_cluster import (
+            NodeState,
+            render_proxmox_bar,
+        )
+
+        # Nodes already sorted alphabetically — as _parse produces them.
+        nodes = [
+            NodeState(name="pve15", online=True, cpu_pct=10.0, mem_pct=10.0),
+            NodeState(name="pve17", online=True, cpu_pct=10.0, mem_pct=10.0),
+            NodeState(name="pve18", online=True, cpu_pct=10.0, mem_pct=10.0),
+        ]
+        snap = _make_snapshot(nodes=nodes, osds=[])
+        result = render_proxmox_bar(snap, 0)
+        plain = result.plain
+
+        idx15 = plain.find("pve15")
+        idx17 = plain.find("pve17")
+        idx18 = plain.find("pve18")
+        assert idx15 >= 0 and idx17 >= 0 and idx18 >= 0
+        # In the rendered text pve15 must appear before pve17 before pve18
+        assert (
+            idx15 < idx17 < idx18
+        ), f"Expected pve15 < pve17 < pve18 positions, got {idx15} {idx17} {idx18}"
+
+
+# ---------------------------------------------------------------------------
+# Bug #8 — Defect 3: Subscription warnings filtered from alerts
+# ---------------------------------------------------------------------------
+
+
+class TestSubscriptionFilter:
+    """Bug #8 Defect 3: subscription-related ceph health checks must be dropped."""
+
+    def test_subscription_code_filtered_out(self) -> None:
+        """A health check whose code contains 'subscription' is dropped."""
+        from claude_visualizer.monitors.proxmox_cluster import build_alerts
+
+        alerts = build_alerts(
+            nodes=[],
+            ha_resources=[],
+            ceph_health={
+                "status": "HEALTH_WARN",
+                "checks": {
+                    "SUBSCRIPTION_STATUS": {
+                        "summary": {"message": "no valid subscription"}
+                    },
+                    "PG_DEGRADED": {"summary": {"message": "Degraded data redundancy"}},
+                },
+            },
+            ceph_used_pct=0.10,
+        )
+        texts = [a.text for a in alerts]
+        assert not any(
+            "subscription" in t.lower() for t in texts
+        ), f"Subscription alert must be filtered, got: {texts}"
+        assert any("Degraded" in t for t in texts), "Real PG_DEGRADED alert must remain"
+
+    def test_subscription_message_filtered_out(self) -> None:
+        """A health check whose message contains 'subscription' is dropped."""
+        from claude_visualizer.monitors.proxmox_cluster import build_alerts
+
+        alerts = build_alerts(
+            nodes=[],
+            ha_resources=[],
+            ceph_health={
+                "status": "HEALTH_WARN",
+                "checks": {
+                    "SOME_CODE": {
+                        "summary": {"message": "no valid subscription found"}
+                    },
+                    "OSD_DOWN": {"summary": {"message": "OSD 3 is down"}},
+                },
+            },
+            ceph_used_pct=0.10,
+        )
+        texts = [a.text for a in alerts]
+        assert not any(
+            "subscription" in t.lower() for t in texts
+        ), f"Subscription message must be filtered, got: {texts}"
+        assert any("OSD 3 is down" in t for t in texts), "Real OSD_DOWN must remain"
+
+    def test_non_subscription_alerts_unaffected(self) -> None:
+        """Non-subscription alerts are not filtered."""
+        from claude_visualizer.monitors.proxmox_cluster import build_alerts
+
+        alerts = build_alerts(
+            nodes=[],
+            ha_resources=[],
+            ceph_health={
+                "status": "HEALTH_WARN",
+                "checks": {
+                    "RECENT_CRASH": {
+                        "summary": {"message": "2 daemons have recently crashed"}
+                    },
+                    "BLUESTORE_SLOW_OP_ALERT": {
+                        "summary": {"message": "slow ops in BlueStore"}
+                    },
+                },
+            },
+            ceph_used_pct=0.10,
+        )
+        assert (
+            len(alerts) == 2
+        ), f"Both non-subscription alerts must remain, got: {alerts}"
+
+
+# ---------------------------------------------------------------------------
+# Bug #8 — Defect 4: Cluster verdict must be QUORUM-based
+# ---------------------------------------------------------------------------
+
+
+class TestQuorumVerdict:
+    """Defect 4: render_proxmox_bar cluster verdict is purely quorum-based.
+
+    quorate=True  → 'Cluster: OK' (green) regardless of offline nodes or WARN alerts.
+    quorate=False → 'Cluster: ERR' (red).
+    Offline nodes remain red dots; they do NOT drive the cluster verdict.
+    """
+
+    def test_quorate_true_no_alerts_shows_ok_green(self) -> None:
+        from rich.console import Console
+
+        from claude_visualizer.monitors.proxmox_cluster import render_proxmox_bar
+
+        snap = _make_snapshot(quorate=True)
+        result = render_proxmox_bar(snap, 0)
+        assert (
+            "Cluster: OK" in result.plain
+        ), f"Expected 'Cluster: OK', got: {result.plain!r}"
+        idx = result.plain.find("OK")
+        assert idx >= 0
+        assert "green" in str(result.get_style_at_offset(Console(), idx)).lower()
+
+    def test_quorate_true_with_offline_node_still_ok_green(self) -> None:
+        """Defect 4 core: quorate=True + offline node → Cluster: OK (green), not ERR."""
+        from rich.console import Console
+
+        from claude_visualizer.monitors.proxmox_cluster import (
+            NodeState,
+            render_proxmox_bar,
+        )
+
+        snap = _make_snapshot(
+            nodes=[
+                NodeState(name="pve1", online=True, cpu_pct=10.0, mem_pct=10.0),
+                NodeState(name="pve19", online=False, cpu_pct=0.0, mem_pct=0.0),
+            ],
+            quorate=True,
+        )
+        result = render_proxmox_bar(snap, 0)
+        assert (
+            "Cluster: OK" in result.plain
+        ), f"quorate=True + offline node must show OK, got: {result.plain!r}"
+        idx = result.plain.find("OK")
+        assert "green" in str(result.get_style_at_offset(Console(), idx)).lower()
+
+    def test_quorate_true_with_warn_alert_still_ok_green(self) -> None:
+        """quorate=True + WARN alert → Cluster: OK green (alerts don't affect verdict)."""
+        from rich.console import Console
+
+        from claude_visualizer.monitors.proxmox_cluster import (
+            Alert,
+            Severity,
+            render_proxmox_bar,
+        )
+
+        snap = _make_snapshot(
+            quorate=True,
+            alerts=[Alert(severity=Severity.WARN, text="some-warn")],
+        )
+        result = render_proxmox_bar(snap, 0)
+        assert (
+            "Cluster: OK" in result.plain
+        ), f"quorate=True + WARN alert must show OK, got: {result.plain!r}"
+        idx = result.plain.find("OK")
+        assert "green" in str(result.get_style_at_offset(Console(), idx)).lower()
+
+    def test_quorate_false_shows_err_red(self) -> None:
+        """quorate=False → Cluster: ERR (red)."""
+        from rich.console import Console
+
+        from claude_visualizer.monitors.proxmox_cluster import render_proxmox_bar
+
+        snap = _make_snapshot(quorate=False)
+        result = render_proxmox_bar(snap, 0)
+        assert (
+            "Cluster: ERR" in result.plain
+        ), f"quorate=False must show ERR, got: {result.plain!r}"
+        idx = result.plain.find("ERR")
+        assert idx >= 0
+        assert "red" in str(result.get_style_at_offset(Console(), idx)).lower()
+
+    def test_offline_node_still_shows_red_dot_when_quorate(self) -> None:
+        """Offline node renders as red dot even when cluster is quorate (pve19 scenario)."""
+        from rich.console import Console
+
+        from claude_visualizer.monitors.proxmox_cluster import (
+            NodeState,
+            render_proxmox_bar,
+        )
+
+        snap = _make_snapshot(
+            nodes=[
+                NodeState(name="pve1", online=True, cpu_pct=10.0, mem_pct=10.0),
+                NodeState(name="pve19", online=False, cpu_pct=0.0, mem_pct=0.0),
+            ],
+            osds=[],
+            quorate=True,
+        )
+        result = render_proxmox_bar(snap, 0)
+        # Find all dot positions
+        dots = [i for i, c in enumerate(result.plain) if c == "●"]
+        assert len(dots) == 2, f"Expected 2 node dots, got {len(dots)}"
+        # pve19 is last (alphabetical sort) → its dot is at dots[1]
+        assert (
+            "red" in str(result.get_style_at_offset(Console(), dots[1])).lower()
+        ), "Offline node dot must be red even when cluster is quorate"
+        # pve1 dot is at dots[0] → NOT red
+        assert "red" not in str(result.get_style_at_offset(Console(), dots[0])).lower()
+
+
+class TestParseQuorate:
+    """Defect 4: _parse extracts quorate from the type=='cluster' entry in /cluster/status."""
+
+    def test_parse_quorate_true_when_quorate_1(self) -> None:
+        """Cluster entry with quorate=1 → snapshot.quorate is True."""
+        from claude_visualizer.monitors.proxmox_cluster import Monitor
+
+        cluster_status = [
+            {"type": "cluster", "name": "LinnerSmall", "quorate": 1, "nodes": 5},
+            {"type": "node", "name": "pve15", "online": 1},
+            {"type": "node", "name": "pve19", "online": 0},
+        ]
+        m = Monitor.__new__(Monitor)
+        snap = m._parse(
+            cluster_status=cluster_status,
+            ceph_status=_CEPH_STATUS_OK,
+            ha_resources=_HA_RESOURCES_OK,
+            nodes=[],
+            osd_tree=None,
+        )
+        assert snap.quorate is True, f"Expected quorate=True, got {snap.quorate}"
+
+    def test_parse_quorate_false_when_quorate_0(self) -> None:
+        """Cluster entry with quorate=0 → snapshot.quorate is False."""
+        from claude_visualizer.monitors.proxmox_cluster import Monitor
+
+        cluster_status = [
+            {"type": "cluster", "name": "LinnerSmall", "quorate": 0, "nodes": 5},
+            {"type": "node", "name": "pve15", "online": 1},
+        ]
+        m = Monitor.__new__(Monitor)
+        snap = m._parse(
+            cluster_status=cluster_status,
+            ceph_status=_CEPH_STATUS_OK,
+            ha_resources=_HA_RESOURCES_OK,
+            nodes=[],
+            osd_tree=None,
+        )
+        assert snap.quorate is False, f"Expected quorate=False, got {snap.quorate}"
+
+    def test_parse_quorate_false_when_no_cluster_entry(self) -> None:
+        """No type=='cluster' entry in cluster_status → snapshot.quorate defaults to False."""
+        from claude_visualizer.monitors.proxmox_cluster import Monitor
+
+        cluster_status = [
+            {"type": "node", "name": "pve1", "online": 1},
+        ]
+        m = Monitor.__new__(Monitor)
+        snap = m._parse(
+            cluster_status=cluster_status,
+            ceph_status=_CEPH_STATUS_OK,
+            ha_resources=_HA_RESOURCES_OK,
+            nodes=[],
+            osd_tree=None,
+        )
+        assert (
+            snap.quorate is False
+        ), f"Missing cluster entry must default quorate to False, got {snap.quorate}"
+
+    def test_parse_quorate_with_pve19_offline_real_scenario(self) -> None:
+        """Real scenario: LinnerSmall cluster, pve19 offline, quorate=1 → quorate=True."""
+        from claude_visualizer.monitors.proxmox_cluster import Monitor
+
+        cluster_status = [
+            {"type": "cluster", "name": "LinnerSmall", "quorate": 1, "nodes": 5},
+            {"type": "node", "name": "pve15", "online": 1},
+            {"type": "node", "name": "pve16", "online": 1},
+            {"type": "node", "name": "pve17", "online": 1},
+            {"type": "node", "name": "pve18", "online": 1},
+            {"type": "node", "name": "pve19", "online": 0},
+        ]
+        m = Monitor.__new__(Monitor)
+        snap = m._parse(
+            cluster_status=cluster_status,
+            ceph_status=_CEPH_STATUS_OK,
+            ha_resources=_HA_RESOURCES_OK,
+            nodes=[],
+            osd_tree=None,
+        )
+        assert snap.quorate is True
+        # pve19 must still be offline (dot state unaffected)
+        pve19 = next(n for n in snap.nodes if n.name == "pve19")
+        assert pve19.online is False
+
+
+# ---------------------------------------------------------------------------
+# Review Nit 1 — _flatten_crush_osds survives "children": null
+# ---------------------------------------------------------------------------
+
+
+class TestCrushNullChildren:
+    """Nit 1: _flatten_crush_osds must not crash when a node has 'children': null."""
+
+    def test_null_children_does_not_raise(self) -> None:
+        """A CRUSH node with children=null (key present, value None) → no TypeError."""
+        from claude_visualizer.monitors.proxmox_cluster import _flatten_crush_osds
+
+        # children key is PRESENT but value is None — the bug scenario.
+        node = {
+            "type": "host",
+            "id": "-3",
+            "name": "pve1",
+            "children": None,  # explicit null
+        }
+        # Must not raise TypeError
+        result = _flatten_crush_osds(node)
+        assert (
+            result == []
+        ), f"Expected empty list for host with null children, got {result}"
+
+    def test_null_children_sibling_osds_still_parsed(self) -> None:
+        """Adjacent subtree with valid children still yields its OSDs."""
+        from claude_visualizer.monitors.proxmox_cluster import (
+            _flatten_crush_osds,
+        )
+
+        root = {
+            "type": None,
+            "name": None,
+            "children": [
+                {
+                    "type": "host",
+                    "id": "-3",
+                    "name": "pve1",
+                    "children": None,  # null — should not crash
+                },
+                {
+                    "type": "host",
+                    "id": "-5",
+                    "name": "pve2",
+                    "children": [
+                        {
+                            "type": "osd",
+                            "id": "7",
+                            "name": "osd.7",
+                            "status": "up",
+                            "in": 1,
+                        }
+                    ],
+                },
+            ],
+        }
+        result = _flatten_crush_osds(root)
+        assert len(result) == 1
+        assert result[0].id == 7
+        assert result[0].up is True
+
+    def test_missing_children_key_still_returns_empty(self) -> None:
+        """A node with no 'children' key at all → empty list (existing behaviour unchanged)."""
+        from claude_visualizer.monitors.proxmox_cluster import _flatten_crush_osds
+
+        node = {"type": "host", "id": "-3", "name": "pve1"}
+        result = _flatten_crush_osds(node)
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Review Nit 2 — OSD endpoint failure: graceful degrade to empty OSD list
+# ---------------------------------------------------------------------------
+
+
+class TestOsdEndpointFailure:
+    """Nit 2: /nodes/{node}/ceph/osd returning HTTP 500 → graceful degrade.
+
+    _fetch must still return a valid snapshot (built from the 4 good endpoints)
+    with an empty OSD list.  No crash, no exception escaping.
+    Anti-mock: real local HTTP server.
+    """
+
+    def test_osd_endpoint_500_yields_snapshot_with_empty_osds(
+        self, tmp_path: Path
+    ) -> None:
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        _RESPONSES: dict = {
+            "/api2/json/cluster/status": [
+                {"type": "cluster", "name": "pve-test", "quorate": 1, "nodes": 1},
+                {
+                    "type": "node",
+                    "id": "node/pve1",
+                    "name": "pve1",
+                    "online": 1,
+                    "local": 1,
+                },
+            ],
+            "/api2/json/cluster/ceph/status": {
+                "health": {"status": "HEALTH_OK", "checks": {}},
+                "osdmap": {"num_osds": 3, "num_up_osds": 3, "num_in_osds": 3},
+                "pgmap": {
+                    "bytes_used": 100_000_000_000,
+                    "bytes_total": 1_000_000_000_000,
+                },
+            },
+            "/api2/json/cluster/ha/resources": [
+                {"sid": "vm:100", "state": "started", "type": "vm"},
+            ],
+            "/api2/json/nodes": [
+                {
+                    "node": "pve1",
+                    "status": "online",
+                    "cpu": 0.20,
+                    "mem": 4_000_000_000,
+                    "maxmem": 16_000_000_000,
+                },
+            ],
+            # /nodes/pve1/ceph/osd is intentionally ABSENT → server returns 500
+        }
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                # OSD endpoint returns 500; all other endpoints return valid JSON.
+                if "ceph/osd" in self.path:
+                    self.send_response(500)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"Internal Server Error")
+                    return
+                data = _RESPONSES.get(self.path)
+                if data is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                body = json.dumps({"data": data}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), _Handler)
+        port = server.server_address[1]
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+
+        try:
+            node_url = f"http://127.0.0.1:{port}"
+            yaml_content = (
+                f"nodes:\n"
+                f"  - {node_url}\n"
+                f"token_id: root@pam!test\n"
+                f"token_secret: dummy\n"
+                f"poll_interval_seconds: 30\n"
+                f"alert_rotate_seconds: 10\n"
+                f"verify_ssl: false\n"
+            )
+            cfg_path = _write_yaml(tmp_path, yaml_content)
+
+            from claude_visualizer.monitors.proxmox_cluster import Monitor
+
+            m = Monitor(config_path=cfg_path)
+            # _fetch() must not raise and must return a valid snapshot.
+            snap = m._fetch()
+
+            assert (
+                snap is not None
+            ), "_fetch must return a snapshot even when OSD endpoint fails"
+            # OSD list must be empty (graceful degrade — can't get CRUSH tree).
+            assert (
+                snap.osds == []
+            ), f"OSD endpoint 500 must yield empty osds list, got: {snap.osds}"
+            # The 4 good endpoints must have populated the rest of the snapshot.
+            assert len(snap.nodes) == 1
+            assert snap.nodes[0].name == "pve1"
+            assert snap.nodes[0].online is True
+            assert snap.ceph_status == "HEALTH_OK"
 
         finally:
             server.shutdown()

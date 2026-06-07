@@ -6,9 +6,11 @@ Zero edits to core modules required — follows the Monitor contract exactly.
 Config file: ``~/.claude-visualizer/proxmox.yaml`` (path injectable for tests).
 Install: ``install.sh``'s ``seed_monitors()`` copies this file automatically.
 
-API poll (every 30s by default): 4 GETs per node — /cluster/status,
-/cluster/ceph/status, /cluster/ha/resources, /nodes. First node answering
-all four endpoints wins (failover). Stale snapshot is kept on total failure.
+API poll (every 30s by default): 5 GETs per node — /cluster/status,
+/cluster/ceph/status, /cluster/ha/resources, /nodes, and
+/nodes/{node}/ceph/osd (CRUSH tree for per-OSD up/in state).
+First node answering all five endpoints wins (failover).
+Stale snapshot is kept on total failure.
 
 Background polling (B1 fix):
     ``tick()`` is non-blocking — it submits ``_fetch()`` via ``_submit_fetch()``,
@@ -23,6 +25,7 @@ Background polling (B1 fix):
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -32,6 +35,8 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 from rich.text import Text
+
+_LOG = logging.getLogger(__name__)
 
 try:
     import requests
@@ -118,6 +123,7 @@ class ProxmoxSnapshot:
     ceph_used_pct: float  # 0.0–1.0
     alerts: List[Alert]
     fetched_at: float
+    quorate: bool = True  # Defect 4: from type=="cluster" entry in /cluster/status
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +175,44 @@ _HA_WARN_STATES = frozenset({"migrate", "relocate", "freeze"})
 
 
 # ---------------------------------------------------------------------------
+# CRUSH tree OSD flattener (Bug #8 Defect 1)
+# ---------------------------------------------------------------------------
+
+
+def _flatten_crush_osds(node: Any) -> List[OSDState]:
+    """Recursively walk a Proxmox CRUSH tree node and collect OSD leaves.
+
+    The tree from ``/nodes/{node}/ceph/osd`` has the shape::
+
+        root → {type: None, children: [{type: "root", children: [
+            {type: "host", children: [
+                {type: "osd", id: "2", status: "up", in: 1, ...},
+                ...
+            ]},
+            ...
+        ]}]}
+
+    Only dicts with ``type == "osd"`` are collected; all other node types
+    (``None``, ``"root"``, ``"host"``) are traversed recursively.
+    Returns an empty list when ``node`` is ``None`` or not a dict.
+    """
+    if not isinstance(node, dict):
+        return []
+    results: List[OSDState] = []
+    if node.get("type") == "osd":
+        results.append(
+            OSDState(
+                id=int(node["id"]),
+                up=(node.get("status") == "up"),
+                in_=bool(node.get("in", 0)),
+            )
+        )
+    for child in node.get("children") or []:
+        results.extend(_flatten_crush_osds(child))
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Alert builder
 # ---------------------------------------------------------------------------
 
@@ -191,6 +235,9 @@ def build_alerts(
     checks: Dict[str, Any] = ceph_health.get("checks", {})
     for code, detail in checks.items():
         msg: str = detail.get("summary", {}).get("message", code)
+        # Bug #8 Defect 3: filter subscription-related warnings (code OR message)
+        if "subscription" in code.lower() or "subscription" in msg.lower():
+            continue
         if code in _CRIT_CEPH_CODES:
             sev = Severity.CRIT
         elif code in _WARN_CEPH_CODES:
@@ -278,17 +325,14 @@ def render_proxmox_bar(snapshot: ProxmoxSnapshot, alert_index: int) -> Text:
     """
     out = Text(no_wrap=True, overflow="ellipsis")
 
-    # --- Cluster verdict ------------------------------------------------------
-    # Determine cluster state from nodes and alerts
-    has_node_offline = any(not n.online for n in snapshot.nodes)
-    has_crit = any(a.severity == Severity.CRIT for a in snapshot.alerts)
-
-    if has_node_offline or has_crit:
-        cluster_label, cluster_colour = "ERR", "red"
-    elif any(a.severity == Severity.WARN for a in snapshot.alerts):
-        cluster_label, cluster_colour = "WARN", "yellow"
-    else:
+    # --- Cluster verdict (Defect 4: quorum-based, not node-offline-based) ----
+    # Proxmox shows cluster GREEN when quorate, even with a node down.
+    # quorate=True  → OK  (green) — cluster has quorum
+    # quorate=False → ERR (red)   — quorum lost
+    if snapshot.quorate:
         cluster_label, cluster_colour = "OK", "green"
+    else:
+        cluster_label, cluster_colour = "ERR", "red"
 
     out.append(" Cluster: ")
     out.append(cluster_label, style=cluster_colour)
@@ -522,11 +566,41 @@ class Monitor:
                 ha_resources = _get("/api2/json/cluster/ha/resources")
                 nodes = _get("/api2/json/nodes")
 
+                # Bug #8 Defect 1: per-OSD state from CRUSH tree.
+                # Pick the first ONLINE node name from cluster_status for the path.
+                # osdmap.osds is null on real Proxmox; this endpoint has the data.
+                osd_tree: Optional[Dict[str, Any]] = None
+                for _entry in cluster_status:
+                    if _entry.get("type") == "node" and bool(_entry.get("online", 0)):
+                        _node_name = _entry.get("name", "")
+                        if _node_name:
+                            try:
+                                osd_tree = _get(
+                                    f"/api2/json/nodes/{_node_name}/ceph/osd"
+                                )
+                            except (
+                                ConnectionError,
+                                Timeout,
+                                HTTPError,
+                                OSError,
+                                KeyError,
+                                ValueError,
+                                TypeError,
+                            ) as _exc:
+                                _LOG.debug(
+                                    "OSD tree fetch failed on node %s: %s",
+                                    _node_name,
+                                    _exc,
+                                )
+                                osd_tree = None
+                            break
+
                 return self._parse(
                     cluster_status=cluster_status,
                     ceph_status=ceph_status,
                     ha_resources=ha_resources,
                     nodes=nodes,
+                    osd_tree=osd_tree,
                 )
             except (
                 ConnectionError,
@@ -548,12 +622,31 @@ class Monitor:
         ceph_status: Dict[str, Any],
         ha_resources: List[Dict[str, Any]],
         nodes: List[Dict[str, Any]],
+        osd_tree: Optional[Dict[str, Any]],
     ) -> ProxmoxSnapshot:
-        """Build a ProxmoxSnapshot from raw Proxmox API dicts."""
+        """Build a ProxmoxSnapshot from raw Proxmox API dicts.
+
+        ``osd_tree`` is the response from ``GET /nodes/{node}/ceph/osd``.
+        When provided, OSD state comes from the CRUSH tree via
+        ``_flatten_crush_osds()``; the ``osdmap.osds`` field (null on real
+        Proxmox) is ignored.  Pass ``None`` when unavailable — results in
+        an empty OSD list.
+
+        Node list is sorted alphabetically by name (Bug #8 Defect 2).
+        """
         # Build a name → node-detail map from /nodes response
         nodes_by_name: Dict[str, Dict[str, Any]] = {n["node"]: n for n in nodes}
 
+        # Defect 4: extract quorate from the type=="cluster" entry.
+        # If no cluster entry is found, default to False (can't confirm quorum).
+        quorate: bool = False
+        for entry in cluster_status:
+            if entry.get("type") == "cluster":
+                quorate = bool(entry.get("quorate", 0))
+                break
+
         # Build NodeState list from /cluster/status entries of type "node"
+        # Bug #8 Defect 2: sort alphabetically by name so display is canonical.
         node_states: List[NodeState] = []
         for entry in cluster_status:
             if entry.get("type") != "node":
@@ -568,14 +661,14 @@ class Monitor:
             node_states.append(
                 NodeState(name=name, online=online, cpu_pct=cpu_pct, mem_pct=mem_pct)
             )
+        node_states.sort(key=lambda n: n.name)
 
-        # Build OSDState list
-        osdmap_section = ceph_status.get("osdmap", {})
-        raw_osds = osdmap_section.get("osds", [])
-        osd_states: List[OSDState] = [
-            OSDState(id=int(o["osd"]), up=bool(o["up"]), in_=bool(o["in"]))
-            for o in raw_osds
-        ]
+        # Build OSDState list from CRUSH tree (Bug #8 Defect 1).
+        # osdmap.osds is null on real Proxmox — use /nodes/{node}/ceph/osd tree.
+        if osd_tree is not None:
+            osd_states: List[OSDState] = _flatten_crush_osds(osd_tree.get("root"))
+        else:
+            osd_states = []
 
         # Ceph health
         ceph_health_block = ceph_status.get("health", {})
@@ -601,4 +694,5 @@ class Monitor:
             ceph_used_pct=ceph_used_pct,
             alerts=alerts,
             fetched_at=time.monotonic(),
+            quorate=quorate,
         )

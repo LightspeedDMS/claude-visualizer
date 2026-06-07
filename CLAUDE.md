@@ -366,6 +366,57 @@ it). Guard is now `not self._polled_once OR now - self._last_poll >=
 poll_interval_seconds`. Inside the block, `_polled_once` is set to `True` and
 `_last_poll = now` after every poll attempt (success or failure).
 
+### proxmox monitor: Bug #8 fixes (`monitors/proxmox_cluster.py`)
+
+**Defect 1 — per-OSD data from CRUSH tree (not `osdmap.osds`).**
+`/cluster/ceph/status → osdmap.osds` is `null` on real Proxmox (only counts like
+`num_osds` are present). Per-OSD `up`/`in` state now comes from a 5th GET:
+`GET /nodes/{node}/ceph/osd` → `{flags, root}` CRUSH tree. `_flatten_crush_osds(root)`
+recursively walks the tree collecting dicts with `type == "osd"` and builds
+`OSDState(id=int(leaf["id"]), up=(leaf["status"] == "up"), in_=bool(leaf["in"]))`.
+The node name used for the path is the first ONLINE node from `/cluster/status`
+(offline nodes can't serve it). Failure on that node is logged at DEBUG and
+`osd_tree=None` is passed to `_parse` (empty OSD list — treated as failover).
+
+**Defect 2 — nodes sorted alphabetically.**
+`_parse` now calls `node_states.sort(key=lambda n: n.name)` after building the list,
+so the snapshot's `nodes` list is always alphabetically ordered regardless of API
+return order. Live cluster renders `pve15 pve16 pve17 pve18 pve19` with `pve19●`
+in red (offline).
+
+**Defect 3 — subscription warnings filtered.**
+`build_alerts` skips any Ceph health check whose code OR summary message contains
+`"subscription"` (case-insensitive) before assigning severity. Prevents Proxmox
+"no valid subscription" nag from appearing in the alert rotator.
+
+**Defect 4 — cluster verdict is QUORUM-based, not node-offline-based.**
+`ProxmoxSnapshot` carries a `quorate: bool = True` field (default preserves
+backward compat with snapshot constructors that pre-date the field). `_parse`
+finds the `type == "cluster"` entry in the `/cluster/status` list and sets
+`quorate = bool(entry.get("quorate", 0))`; if no such entry exists it defaults
+to `False` (can't confirm quorum → treat as not OK). `render_proxmox_bar` uses
+a **purely binary** verdict from this field:
+- `snapshot.quorate is True`  → `Cluster: OK`  coloured **green**
+- `snapshot.quorate is False` → `Cluster: ERR` coloured **red**
+
+This matches Proxmox's own green-checkbox behavior: the cluster is healthy when
+quorate even if a node is offline. The offline node still renders as a **red dot**
+(`pve19●` in red) and the `"Node pve19 offline"` CRIT alert still appears in the
+rotator — but neither forces the cluster verdict to red. Ceph health and HA
+state are independent segments, unchanged.
+
+Live proof (pve19 offline, quorate=1): `Cluster: OK │ … pve15● … pve19●(red) │ …`.
+
+**Nit 1 — `_flatten_crush_osds` handles `"children": null`.**
+`node.get("children", [])` returned `None` when the key was present-but-null
+(default only applies when the key is absent). Fixed to `(node.get("children") or [])`.
+
+**Nit 2 — OSD endpoint failure degrades gracefully.**
+When `GET /nodes/{node}/ceph/osd` returns HTTP 500 (or any caught exception),
+`_fetch` catches it, logs at DEBUG, and passes `osd_tree=None` to `_parse`,
+yielding an empty OSD list. The snapshot is still built from the 4 good
+endpoints; no crash, no exception escaping.
+
 ### Development install: use EDITABLE (`pip install -e .`)
 `install.sh` does a NON-editable `pip install "$PROJECT_DIR"` — it COPIES the
 sources into `.venv/.../site-packages`. The console script
