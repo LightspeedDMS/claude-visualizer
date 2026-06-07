@@ -2,13 +2,22 @@
 
 This module is the RELOCATED home of the system-resource rendering logic that
 previously lived in ``ui/panels.py``.  It exposes the identical public API so
-the 12 existing ``test_system_stats.py`` tests and the 13 ``TestRenderStatusBar``
-/ ``TestFmtRate`` tests in ``test_ui.py`` remain unchanged — only the import
-path shifts from ``claude_visualizer.ui.panels`` to
-``claude_visualizer.monitors.zzz_machine_stats`` (AC4).
+the 12 existing ``test_system_stats.py`` model tests remain unchanged.
+The ``TestRenderStatusBar`` / ``TestFmtRate`` tests in ``test_ui.py`` were
+updated to assert the fixed-width column layout described below, and a
+column-stability test was added to guard against horizontal jitter.
 
-``Monitor.tick(now)`` returns the same ``render_status_bar`` output so the
-bar line is byte-identical to the pre-refactor status bar.
+``render_status_bar`` uses **fixed-width** numeric fields so the status bar
+columns never jitter horizontally as values change digit-count:
+
+  - CPU %  is right-aligned to 3 chars  (``f"{pct:>3}%"`` → constant 4-char slot)
+  - RAM %  is right-aligned to 3 chars  (same)
+  - free RAM token is right-aligned to 6 chars before `` free``
+    (covers ``0M`` … ``1023M`` and ``1.0G`` … ``999.9G``; ≥1 TB → ``1024.0G``
+    overflows to 7 chars but that is an extraordinary edge case)
+
+Disk/Net rates were already fixed-width via ``_fmt_rate(...).ljust(7)`` and
+are unchanged.
 
 The ``zzz_`` prefix ensures this file sorts alphabetically last when the
 registry loads monitors, so user-added monitors appear before the built-in
@@ -63,11 +72,17 @@ def _fmt_rate(bps: float) -> str:
 
 
 def render_status_bar(snapshot: SystemStatsSnapshot) -> Text:
-    """Render the one-line system-stats bar (Design B).
+    """Render the one-line system-stats bar with fixed-width numeric columns.
 
-    Output is IDENTICAL to the pre-refactor ``panels.render_status_bar``
-    so AC4 is satisfied — existing tests prove the colours and content
-    are unchanged.
+    CPU %, RAM %, and free-RAM are rendered in fixed-width slots so the
+    '│ Disk' and '│ Net' separators never shift horizontally as values
+    change digit-count (anti-jitter layout):
+
+      - CPU/RAM % : right-aligned to 3 chars  (``":>3"``)
+      - free RAM  : value token right-aligned to 6 chars before `` free``
+                    (covers M range 0–1023 and G range 1.0–999.9)
+
+    Disk/Net rates use ``_fmt_rate(...).ljust(7)`` and are unchanged.
     """
     out = Text(no_wrap=True, overflow="ellipsis")
 
@@ -80,18 +95,19 @@ def render_status_bar(snapshot: SystemStatsSnapshot) -> Text:
 
     out.append(" CPU ")
     _bar(snapshot.cpu_pct)
-    out.append(f" {int(snapshot.cpu_pct)}%")
+    out.append(f" {int(snapshot.cpu_pct):>3}%")
 
     out.append(" │ ", style="dim")
     out.append("RAM ")
     _bar(snapshot.ram_pct)
-    out.append(f" {int(snapshot.ram_pct)}%")
+    out.append(f" {int(snapshot.ram_pct):>3}%")
 
     free = snapshot.ram_free_bytes
     if free >= 1024**3:
-        out.append(f"  {free / 1024 ** 3:.1f}G free")
+        free_str = f"{free / 1024 ** 3:.1f}G"
     else:
-        out.append(f"  {free / 1024 ** 2:.0f}M free")
+        free_str = f"{free / 1024 ** 2:.0f}M"
+    out.append(f"  {free_str:>6} free")
 
     out.append(" │ ", style="dim")
     out.append(
@@ -114,8 +130,8 @@ def render_status_bar(snapshot: SystemStatsSnapshot) -> Text:
 class Monitor:
     """Bundled machine-stats monitor: wraps SystemStatsModel for the registry.
 
-    ``tick(now)`` returns the same ``Text`` object as the pre-refactor
-    ``StatusBar.update_from_snapshot``  — byte-identical output (AC4).
+    ``tick(now)`` returns the ``render_status_bar`` line with fixed-width,
+    stable (non-jittering) CPU/RAM/free columns.
     """
 
     def __init__(self) -> None:

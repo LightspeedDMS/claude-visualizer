@@ -1457,6 +1457,46 @@ class TestRenderStatusBar:
         text = render_status_bar(_snapshot())
         assert "Net" in text.plain
 
+    def test_render_status_bar_column_stability(self):
+        """Anti-jitter: '│ Disk' and 'free' offsets are identical for all digit-count combos.
+
+        Snapshots span the full range of variable digit-counts:
+          cpu_pct  ∈ {5, 50, 100}
+          ram_pct  ∈ {5, 50, 100}
+          ram_free ∈ {512 MB (sub-G), 37.5 GB (large-G)}
+
+        After the fixed-width fix every combination must render ' │ Disk'
+        starting at the same byte offset and 'free' at the same offset,
+        proving the columns never jitter horizontally.
+        """
+        from claude_visualizer.monitors.zzz_machine_stats import render_status_bar
+
+        _512_MB = 512 * 1024 * 1024
+        _37_5_GB = int(37.5 * 1024**3)
+
+        snapshots = [
+            _snapshot(cpu_pct=cpu, ram_pct=ram, ram_free_bytes=free_bytes)
+            for cpu in (5.0, 50.0, 100.0)
+            for ram in (5.0, 50.0, 100.0)
+            for free_bytes in (_512_MB, _37_5_GB)
+        ]
+
+        plains = [render_status_bar(s).plain for s in snapshots]
+
+        disk_offsets = [p.index(" │ Disk") for p in plains]
+        free_offsets = [p.index(" free") for p in plains]
+
+        assert (
+            len(set(disk_offsets)) == 1
+        ), f"' │ Disk' offset varies across snapshots: {disk_offsets}\n" + "\n".join(
+            plains
+        )
+        assert (
+            len(set(free_offsets)) == 1
+        ), f"'free' offset varies across snapshots: {free_offsets}\n" + "\n".join(
+            plains
+        )
+
 
 class TestFmtRate:
     """Tests 15-19: _fmt_rate auto-scaling and fixed-width padding.
