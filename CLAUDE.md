@@ -132,6 +132,25 @@ Routing is by event type: `FileModifiedEvent` → MRU + diff queue; `CommandEven
   Renderer layout: `Cluster: OK/WARN/ERR │ Ceph: <status> │ <name>● per node
   │ ● per OSD (id asc) osds │ ↻ ⚑ <alert>` or `↻ no alerts`.
   Dependencies: `requests>=2.31` (HTTP), `pyyaml>=6` (config).
+  `monitors/proxmox_perf.py` is a SECOND drop-in Proxmox monitor — a cluster-wide
+  **performance** line. Filename sorts AFTER `proxmox_cluster.py` and before
+  `zzz_machine_stats.py`, so the registry stacks it BELOW the health line and
+  ABOVE the local machine-stats line. Zero edits to core or to the health monitor
+  (drop-in); it REUSES `ProxmoxConfig` / `_load_config` imported from
+  `proxmox_cluster.py` (same `~/.claude-visualizer/proxmox.yaml`) and mirrors the
+  same non-blocking daemon-thread poll + 30 s throttle (B1). Each poll aggregates
+  **online** nodes from three endpoints: `/cluster/resources` (CPU% load-weighted
+  `Σ(cpu·maxcpu)/Σmaxcpu`, RAM% `Σmem/Σmaxmem` + free, cores, running/total VMs),
+  `/cluster/ceph/status` `pgmap` (Ceph read/write MB/s + IOPS), and
+  `/nodes/{node}/rrddata?timeframe=hour` per online node (Σnetin/Σnetout = Net ↓↑,
+  mean `loadavg`). `render_perf_bar(snapshot, *, stale=False)` uses fixed-width
+  fields and colour thresholds (CPU%/RAM% green `<60`/yellow `>=60`/red `>=80`;
+  load green `<0.7·cores`/yellow `>=0.7·cores`/red `>=1.0·cores`). It is a
+  **supplementary** line: `tick()` returns `""` (silent, no row) when there is no
+  config or no snapshot yet (the health line owns `connecting…`/`UNREACHABLE`
+  messaging), and renders the last-known line `dim` when the latest fetch failed.
+  Layout: `CPU n% │ RAM n% <free>G free │ load x.x │ Ceph r/wM·ri/wio │
+  Net ↓ ↑ │ ⚙ run/tot VMs`. Seeded automatically by `install.sh`'s generic loop.
 - **`ui/panels.py`** — pure formatters + thin `Static` widgets (no IO/parse on
   the render path). MRU: `format_mru_row`/`render_mru` + `MruFilesPanel`. Diff
   (story #3): `shorten_model` (strips `claude-`), `format_diff_header`
