@@ -146,8 +146,10 @@ Routing is by event type: `FileModifiedEvent` → MRU + diff queue; `CommandEven
   `…` ellipsis, `len ≤ width`), `format_command_row(entry, width)` (whole row
   fits `width` — the command is the flexible field, time/origin suffix fixed;
   `HH:MM:SS` or `MISSING_TIME_TEXT`; `project · session` + `⤷sub`),
-  `render_commands(model, width)` (newest-on-top block, waiting text when empty)
-  + the `CommandsPanel` widget. (`PlaceholderPanel` was removed once story #4
+  `render_commands(model, scroll_offset, width, focused)` (newest-on-top block
+  from `rows[scroll_offset:]`, waiting text when empty; `focused` highlights the
+  title) + the `CommandsPanel` widget (scroll/wheel/autoscroll-follow — see
+  Keyboard navigation gotcha). (`PlaceholderPanel` was removed once story #4
   filled the bottom region — MESSI #12 anti-orphan.) Monitor bar (story #6):
   `_filter_active_monitor_lines(lines)` strips empty `str`/`Text` entries
   (suppressed monitors), `render_monitor_bar(lines)` joins the remaining entries
@@ -194,6 +196,43 @@ Routing is by event type: `FileModifiedEvent` → MRU + diff queue; `CommandEven
   `claude-visualizer` and `python -m claude_visualizer`.
 
 ## Load-bearing behaviors / gotchas
+
+### Keyboard navigation, focus & scrolling (`ui/app.py`, `ui/panels.py`)
+- **Splitters move on `Shift`+Arrow, NOT plain arrows.** `app.on_key` handles
+  ONLY `shift+left/right` (resize the MRU↔Diff vertical splitter via `_mru_width`)
+  and `shift+up/down` (resize the Commands height via `_bottom_height`), each
+  with `event.stop()`. Plain arrows are reserved for scrolling the focused panel.
+  App `BINDINGS` are only `q`/`ctrl+c`/`p` — no arrow binding competes.
+- **The three panels are focusable** (`can_focus = True` on `MruFilesPanel`/
+  `DiffPanel`/`CommandsPanel`; the splitter handles stay non-focusable). `Tab`/
+  `Shift+Tab` cycle MRU→Diff→Commands (Textual's default focus chain); clicking a
+  panel focuses it (`self.focus()` in `on_mouse_down`).
+- **Focus indicator = the focused panel's TITLE rendered `bold reverse`** —
+  title-only, NO border, so `content_size` is unchanged and there is ZERO layout
+  shift (the size helpers read `content_size`/`size` live). Each `render_mru`/
+  `render_diff`/`render_commands` takes `focused: bool = False` and styles its
+  title `"bold reverse" if focused else "bold"`. The panels keep the highlight in
+  sync via the reactive watcher **`watch_has_focus(self, has_focus)`** which
+  re-renders from stored state with `focused=has_focus`. Do NOT use
+  `on_focus`/`on_blur` for this — those fire BEFORE Textual updates the
+  `has_focus` reactive, so the re-render reads a stale `False` and the title never
+  highlights (this regressed silently once). The steady-state refresh path
+  (`update_from_*`) also passes `focused=self.has_focus`.
+- **`↑`/`↓` scroll the focused panel.** Each panel's `on_key` handles ONLY
+  `up`/`down` and calls `event.stop()` (so `tab`/`q`/`p`/`shift+*` still bubble):
+  MRU → `_scroll_mru(±1)`, Commands → `_scroll_commands(±1)`, Diff → posts
+  `DiffScrolled(±1)` which the app forwards to `DiffQueueModel.scroll_pin_by()` —
+  a no-op unless pinned, so **`↑`/`↓` scroll the Diff ONLY when pinned** (same
+  rule as the wheel; press `p` or click an MRU row to pin).
+- **Commands autoscroll-follow.** `CommandsPanel` holds `_scroll_offset` +
+  `_follow` (+ `_last_model`/`_last_width` for re-render). `render_commands`
+  renders `rows[scroll_offset:]` (rows are newest-first → offset 0 = newest at
+  top). Wheel (`on_mouse_scroll_*`) and `↑`/`↓` call `_scroll_commands`, which
+  clamps the offset to `[0, len-1]` and sets `_follow = (offset == 0)`.
+  `update_from_model` resets the offset to 0 when `_follow` (a NEW command keeps
+  the newest visible — autoscroll), and PRESERVES the offset when the user has
+  scrolled away (`_follow == False`) so they are never yanked back to the top;
+  scrolling back to 0 re-arms follow.
 
 ### parser: `project_tag = basename(cwd)`
 `project_tag` is derived as `os.path.basename(entry["cwd"])`. Real Claude Code
