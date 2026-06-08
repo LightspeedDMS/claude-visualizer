@@ -44,6 +44,19 @@ def _yaml_for_url(url: str) -> str:
         """)
 
 
+def _yaml_for_url_with_perf_interval(url: str, perf_interval: float) -> str:
+    return textwrap.dedent(f"""\
+        nodes:
+          - {url}
+        token_id: root@pam!test
+        token_secret: dummy
+        poll_interval_seconds: 30
+        alert_rotate_seconds: 10
+        verify_ssl: false
+        perf_poll_interval_seconds: {perf_interval}
+        """)
+
+
 # ---------------------------------------------------------------------------
 # Real HTTP server fixture data — 3 online nodes + 1 offline node
 #
@@ -896,16 +909,18 @@ class TestStaleTracking:
 
 
 class TestPollThrottle:
-    """tick() respects poll_interval_seconds (same pattern as health monitor)."""
+    """tick() respects _poll_interval_seconds (the perf-specific interval, default 1s)."""
 
-    def test_no_poll_before_interval(self, tmp_path: Path) -> None:
+    def test_no_poll_while_in_flight(self, tmp_path: Path) -> None:
+        """While a fetch is in-flight, a second tick must not submit a new fetch."""
         from claude_visualizer.monitors.proxmox_perf import Monitor
 
         cfg = _write_yaml(tmp_path, _yaml_for_url("http://127.0.0.1:1"))
         m = Monitor(config_path=cfg)
         m.tick(0.0)
         last = m._last_poll
-        m.tick(15.0)  # 15 < poll_interval(30)
+        # Even though 15s >> _poll_interval_seconds(1.0), in-flight guard prevents re-poll
+        m.tick(15.0)
         assert m._last_poll == pytest.approx(last)
 
     def test_poll_after_interval(self, tmp_path: Path) -> None:
@@ -919,8 +934,9 @@ class TestPollThrottle:
                 m._in_flight.result(timeout=3.0)
             except Exception:
                 pass
-        m.tick(31.0)
-        assert m._last_poll == pytest.approx(31.0)
+        # With _poll_interval_seconds=1.0, 2.0s is beyond the interval
+        m.tick(2.0)
+        assert m._last_poll == pytest.approx(2.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1022,3 +1038,290 @@ class TestCephEndpointAbsent:
             assert snap.ceph_write_bps == pytest.approx(0.0, abs=0.01)
         finally:
             server.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# AC12 — Configurable perf poll interval (perf_poll_interval_seconds)
+# ---------------------------------------------------------------------------
+
+
+class TestPerfPollInterval:
+    """_poll_interval_seconds defaults to 1.0 and reads perf_poll_interval_seconds from yaml."""
+
+    def test_default_poll_interval_is_1s(self, tmp_path: Path) -> None:
+        """Monitor built from yaml without perf_poll_interval_seconds → 1.0s."""
+        from claude_visualizer.monitors.proxmox_perf import Monitor
+
+        cfg = _write_yaml(tmp_path, _yaml_for_url("http://127.0.0.1:1"))
+        m = Monitor(config_path=cfg)
+        assert m._poll_interval_seconds == pytest.approx(
+            1.0
+        ), f"Expected default 1.0s, got {m._poll_interval_seconds}"
+
+    def test_poll_interval_reads_from_yaml(self, tmp_path: Path) -> None:
+        """Monitor with perf_poll_interval_seconds: 2.5 in yaml → 2.5s."""
+        from claude_visualizer.monitors.proxmox_perf import Monitor
+
+        cfg = _write_yaml(
+            tmp_path,
+            _yaml_for_url_with_perf_interval("http://127.0.0.1:1", 2.5),
+        )
+        m = Monitor(config_path=cfg)
+        assert m._poll_interval_seconds == pytest.approx(
+            2.5
+        ), f"Expected 2.5s from yaml, got {m._poll_interval_seconds}"
+
+    def test_nonpositive_interval_floored_to_minimum(self, tmp_path: Path) -> None:
+        """A non-positive perf_poll_interval_seconds must be floored (no busy-loop)."""
+        from claude_visualizer.monitors.proxmox_perf import Monitor
+
+        cfg = _write_yaml(
+            tmp_path,
+            _yaml_for_url_with_perf_interval("http://127.0.0.1:1", -5.0),
+        )
+        m = Monitor(config_path=cfg)
+        assert (
+            m._poll_interval_seconds >= 0.1
+        ), f"Non-positive interval must be floored ≥ 0.1, got {m._poll_interval_seconds}"
+
+    def test_zero_interval_floored_to_minimum(self, tmp_path: Path) -> None:
+        """perf_poll_interval_seconds: 0 must be floored (no busy-loop)."""
+        from claude_visualizer.monitors.proxmox_perf import Monitor
+
+        cfg = _write_yaml(
+            tmp_path,
+            _yaml_for_url_with_perf_interval("http://127.0.0.1:1", 0.0),
+        )
+        m = Monitor(config_path=cfg)
+        assert (
+            m._poll_interval_seconds >= 0.1
+        ), f"Zero interval must be floored ≥ 0.1, got {m._poll_interval_seconds}"
+
+    def test_missing_config_has_default_interval(self, tmp_path: Path) -> None:
+        """No config file → _poll_interval_seconds defaults to 1.0 (graceful)."""
+        from claude_visualizer.monitors.proxmox_perf import Monitor
+
+        m = Monitor(config_path=tmp_path / "nonexistent.yaml")
+        assert m._poll_interval_seconds == pytest.approx(
+            1.0
+        ), f"Missing config must default to 1.0s, got {m._poll_interval_seconds}"
+
+    def test_throttle_uses_perf_interval_not_shared_interval(
+        self, tmp_path: Path
+    ) -> None:
+        """After in-flight resolves, a tick at now > _poll_interval_seconds re-polls.
+
+        With default 1.0s, a tick at now=2.0 (after waiting for port-1 to fail)
+        must submit a new fetch — proving the throttle uses _poll_interval_seconds=1.0
+        rather than the shared poll_interval_seconds=30.
+        """
+        from claude_visualizer.monitors.proxmox_perf import Monitor
+
+        cfg = _write_yaml(tmp_path, _yaml_for_url("http://127.0.0.1:1"))
+        m = Monitor(config_path=cfg)
+        # First tick submits the fetch
+        m.tick(0.0)
+        assert m._in_flight is not None
+        # Wait for it to fail (port 1 → connection refused, fast)
+        try:
+            m._in_flight.result(timeout=3.0)
+        except Exception:
+            pass
+        # Collect the failed result
+        m.tick(0.5)
+        # Now advance by more than _poll_interval_seconds (1.0)
+        m.tick(2.0)
+        # A new fetch should have been submitted at now=2.0
+        assert m._last_poll == pytest.approx(
+            2.0
+        ), f"Expected new poll at 2.0 (interval=1.0s), _last_poll={m._last_poll}"
+
+
+# ---------------------------------------------------------------------------
+# AC13 — CPU bar left-alignment: leading space before "CPU"
+# ---------------------------------------------------------------------------
+
+
+class TestPerfBarAlignment:
+    """render_perf_bar output starts with ' CPU' (leading space + CPU label)."""
+
+    def test_perf_bar_starts_with_space_cpu(self) -> None:
+        """render_perf_bar(snap).plain must start with ' CPU'."""
+        from claude_visualizer.monitors.proxmox_perf import render_perf_bar
+
+        snap = _make_perf_snapshot()
+        plain = render_perf_bar(snap).plain
+        assert plain.startswith(" CPU"), f"Expected ' CPU' at start, got {plain[:12]!r}"
+
+    def test_perf_bar_left_edge_starts_with_space(self) -> None:
+        """The very first character of the perf bar is a space."""
+        from claude_visualizer.monitors.proxmox_perf import render_perf_bar
+
+        snap = _make_perf_snapshot()
+        plain = render_perf_bar(snap).plain
+        assert plain[0] == " ", f"First char must be space, got {plain[0]!r}"
+
+    def test_ram_position_unchanged_after_leading_space(self) -> None:
+        """Fixed-width CPU field: 'RAM' position must be the same for any cpu_pct."""
+        from claude_visualizer.monitors.proxmox_perf import render_perf_bar
+
+        snap_low = _make_perf_snapshot(cpu_pct=5.0)
+        snap_high = _make_perf_snapshot(cpu_pct=100.0)
+        plain_low = render_perf_bar(snap_low).plain
+        plain_high = render_perf_bar(snap_high).plain
+        pos_low = plain_low.find("RAM")
+        pos_high = plain_high.find("RAM")
+        assert (
+            pos_low == pos_high
+        ), f"'RAM' shifted from {pos_low} to {pos_high} — fixed-width broken"
+
+
+# ---------------------------------------------------------------------------
+# AC15 — CPU and RAM bar characters (█/░)
+# ---------------------------------------------------------------------------
+
+
+class TestPerfBarBars:
+    """CPU and RAM sections contain filled (█) and empty (░) bar characters."""
+
+    def test_cpu_section_contains_bar_fill(self) -> None:
+        from claude_visualizer.monitors.proxmox_perf import render_perf_bar
+
+        snap = _make_perf_snapshot(cpu_pct=50.0)
+        plain = render_perf_bar(snap).plain
+        # 50% should have both filled and empty characters
+        assert "█" in plain, f"Expected bar fill '█' in {plain!r}"
+        assert "░" in plain, f"Expected bar empty '░' in {plain!r}"
+
+    def test_zero_cpu_has_all_empty_bar(self) -> None:
+        from claude_visualizer.monitors.proxmox_perf import render_perf_bar
+
+        snap = _make_perf_snapshot(cpu_pct=0.0, ram_pct=0.0)
+        plain = render_perf_bar(snap).plain
+        # 0% → no filled chars; all empty
+        assert "░" in plain, f"Expected empty bar chars for 0%, got {plain!r}"
+
+    def test_full_cpu_has_all_filled_bar(self) -> None:
+        from claude_visualizer.monitors.proxmox_perf import render_perf_bar
+
+        snap = _make_perf_snapshot(cpu_pct=100.0, ram_pct=100.0)
+        plain = render_perf_bar(snap).plain
+        assert "█" in plain, f"Expected filled bar chars for 100%, got {plain!r}"
+
+    def test_cpu_bar_fill_proportional_to_pct(self) -> None:
+        """25% CPU → 2 filled chars out of 8."""
+        from claude_visualizer.monitors.proxmox_perf import render_perf_bar
+
+        snap = _make_perf_snapshot(cpu_pct=25.0)
+        plain = render_perf_bar(snap).plain
+        # Find the CPU section: after "CPU " until the first " " after the bar
+        cpu_idx = plain.index("CPU ") + len("CPU ")
+        bar_section = plain[cpu_idx : cpu_idx + 8]
+        filled_count = bar_section.count("█")
+        # round(8 * 25 / 100) = round(2.0) = 2
+        assert (
+            filled_count == 2
+        ), f"Expected 2 filled chars for 25%, got {filled_count} in {bar_section!r}"
+
+
+# ---------------------------------------------------------------------------
+# AC16 — IOPS section format: r:/w: prefixes and io/s suffix
+# ---------------------------------------------------------------------------
+
+
+class TestPerfBarIOPSFormat:
+    """Ceph IOPS section has 'r:' and 'w:' prefixes and 'io/s' suffix."""
+
+    def test_iops_has_r_prefix(self) -> None:
+        from claude_visualizer.monitors.proxmox_perf import render_perf_bar
+
+        snap = _make_perf_snapshot(ceph_read_iops=100.0, ceph_write_iops=200.0)
+        plain = render_perf_bar(snap).plain
+        # After the throughput section, there should be " · r:" for IOPS
+        assert " · r:" in plain, f"Expected ' · r:' IOPS prefix, got: {plain!r}"
+
+    def test_iops_has_w_prefix(self) -> None:
+        from claude_visualizer.monitors.proxmox_perf import render_perf_bar
+
+        snap = _make_perf_snapshot(ceph_read_iops=100.0, ceph_write_iops=200.0)
+        plain = render_perf_bar(snap).plain
+        assert " w:" in plain, f"Expected ' w:' IOPS prefix, got: {plain!r}"
+
+    def test_iops_has_io_s_suffix(self) -> None:
+        from claude_visualizer.monitors.proxmox_perf import render_perf_bar
+
+        snap = _make_perf_snapshot(ceph_read_iops=100.0, ceph_write_iops=200.0)
+        plain = render_perf_bar(snap).plain
+        assert "io/s" in plain, f"Expected 'io/s' suffix, got: {plain!r}"
+
+    def test_ceph_throughput_has_r_w_prefixes(self) -> None:
+        from claude_visualizer.monitors.proxmox_perf import render_perf_bar
+
+        snap = _make_perf_snapshot(
+            ceph_read_bps=10 * 1024 * 1024, ceph_write_bps=20 * 1024 * 1024
+        )
+        plain = render_perf_bar(snap).plain
+        # Ceph throughput section: "Ceph r:  10.0M w:  20.0M"
+        assert (
+            "Ceph r:" in plain
+        ), f"Expected 'Ceph r:' in throughput section, got: {plain!r}"
+
+
+# ---------------------------------------------------------------------------
+# AC17 — Fixed-width: bar plain-text length is constant
+# ---------------------------------------------------------------------------
+
+
+class TestPerfBarFixedWidth:
+    """Plain-text length of the bar is constant regardless of input values."""
+
+    def test_bar_length_stable_small_vs_large_values(self) -> None:
+        """Render with minimal values and maximal values — same plain length."""
+        from claude_visualizer.monitors.proxmox_perf import render_perf_bar
+
+        snap_small = _make_perf_snapshot(
+            cpu_pct=0.0,
+            ram_pct=0.0,
+            ram_free_bytes=0.0,
+            cores=1,
+            load_avg=0.0,
+            ceph_read_bps=0.0,
+            ceph_write_bps=0.0,
+            ceph_read_iops=0.0,
+            ceph_write_iops=0.0,
+            net_in_bps=0.0,
+            net_out_bps=0.0,
+            running_vms=0,
+            total_vms=0,
+        )
+        snap_large = _make_perf_snapshot(
+            cpu_pct=99.9,
+            ram_pct=99.9,
+            ram_free_bytes=999 * _GB,
+            cores=999,
+            load_avg=999.9,
+            ceph_read_bps=999e9,
+            ceph_write_bps=999e9,
+            ceph_read_iops=99999.0,
+            ceph_write_iops=99999.0,
+            net_in_bps=999e9,
+            net_out_bps=999e9,
+            running_vms=99,
+            total_vms=99,
+        )
+        plain_small = render_perf_bar(snap_small).plain
+        plain_large = render_perf_bar(snap_large).plain
+        assert len(plain_small) == len(plain_large), (
+            f"Bar length not stable: small={len(plain_small)}, large={len(plain_large)}\n"
+            f"  small: {plain_small!r}\n"
+            f"  large: {plain_large!r}"
+        )
+
+    def test_net_section_uses_fmt_rate_format(self) -> None:
+        """Net section uses fixed-width rate format matching machine stats (e.g. '0B/s  ')."""
+        from claude_visualizer.monitors.proxmox_perf import render_perf_bar
+
+        snap = _make_perf_snapshot(net_in_bps=0.0, net_out_bps=0.0)
+        plain = render_perf_bar(snap).plain
+        # 0 bytes/s → "0B/s" padded to 7 chars
+        assert "0B/s" in plain, f"Expected '0B/s' net format, got: {plain!r}"

@@ -318,19 +318,36 @@ class MruFilesPanel(Static):
         """Rows per page-scroll: content height minus title chrome, floored at 1."""
         return max(1, self.content_size.height - _PANEL_TITLE_CHROME)
 
+    def _select_at_offset(self) -> None:
+        """Post FileClicked for the entry at _scroll_offset (keyboard selection).
+
+        Called after every keyboard scroll so that ↑/↓/PageUp/PageDown both
+        move the visible row window AND pin the diff to the newly-highlighted
+        entry — the same effect as clicking a row with the mouse.  Mouse wheel
+        handlers intentionally do NOT call this method (wheel is scroll-only).
+        """
+        if self._rows and 0 <= self._scroll_offset < len(self._rows):
+            self.post_message(
+                self.FileClicked(self._rows[self._scroll_offset].file_path)
+            )
+
     def on_key(self, event) -> None:
-        """↑/↓/PageUp/PageDown scroll the MRU row window when this panel is focused."""
+        """↑/↓/PageUp/PageDown scroll the MRU row window and select the row."""
         if event.key == "up":
             self._scroll_mru(-1)
+            self._select_at_offset()
             event.stop()
         elif event.key == "down":
             self._scroll_mru(1)
+            self._select_at_offset()
             event.stop()
         elif event.key == "pagedown":
             self._scroll_mru(self._page_step())
+            self._select_at_offset()
             event.stop()
         elif event.key == "pageup":
             self._scroll_mru(-self._page_step())
+            self._select_at_offset()
             event.stop()
 
     def on_mouse_down(self, event) -> None:

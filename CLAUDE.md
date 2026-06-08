@@ -137,19 +137,26 @@ Routing is by event type: `FileModifiedEvent` → MRU + diff queue; `CommandEven
   `zzz_machine_stats.py`, so the registry stacks it BELOW the health line and
   ABOVE the local machine-stats line. Zero edits to core or to the health monitor
   (drop-in); it REUSES `ProxmoxConfig` / `_load_config` imported from
-  `proxmox_cluster.py` (same `~/.claude-visualizer/proxmox.yaml`) and mirrors the
-  same non-blocking daemon-thread poll + 30 s throttle (B1). Each poll aggregates
-  **online** nodes from three endpoints: `/cluster/resources` (CPU% load-weighted
-  `Σ(cpu·maxcpu)/Σmaxcpu`, RAM% `Σmem/Σmaxmem` + free, cores, running/total VMs),
-  `/cluster/ceph/status` `pgmap` (Ceph read/write MB/s + IOPS), and
-  `/nodes/{node}/rrddata?timeframe=hour` per online node (Σnetin/Σnetout = Net ↓↑,
-  mean `loadavg`). `render_perf_bar(snapshot, *, stale=False)` uses fixed-width
-  fields and colour thresholds (CPU%/RAM% green `<60`/yellow `>=60`/red `>=80`;
-  load green `<0.7·cores`/yellow `>=0.7·cores`/red `>=1.0·cores`). It is a
-  **supplementary** line: `tick()` returns `""` (silent, no row) when there is no
-  config or no snapshot yet (the health line owns `connecting…`/`UNREACHABLE`
-  messaging), and renders the last-known line `dim` when the latest fetch failed.
-  Layout: `CPU n% │ RAM n% <free>G free │ load x.x │ Ceph r/wM·ri/wio │
+  `proxmox_cluster.py` (same `~/.claude-visualizer/proxmox.yaml`) and uses the
+  same non-blocking daemon-thread B1 pattern. **Poll interval is separate from the
+  health monitor**: `Monitor.__init__` reads the optional `perf_poll_interval_seconds`
+  key from `proxmox.yaml` (default `1.0` s if absent or on parse error; floored to
+  `0.1` s minimum to prevent busy-loops) into `self._poll_interval_seconds`, which
+  the throttle guard uses exclusively — the health monitor's `poll_interval_seconds`
+  (30 s) is unaffected. Each poll aggregates **online** nodes from three endpoints:
+  `/cluster/resources` (CPU% load-weighted `Σ(cpu·maxcpu)/Σmaxcpu`, RAM%
+  `Σmem/Σmaxmem` + free, cores, running/total VMs), `/cluster/ceph/status` `pgmap`
+  (Ceph read/write MB/s + IOPS), and `/nodes/{node}/rrddata?timeframe=hour` per
+  online node (Σnetin/Σnetout = Net ↓↑, mean `loadavg`).
+  `render_perf_bar(snapshot, *, stale=False)` uses fixed-width fields and colour
+  thresholds (CPU%/RAM% green `<60`/yellow `>=60`/red `>=80`; load green
+  `<0.7·cores`/yellow `>=0.7·cores`/red `>=1.0·cores`). The bar **starts with a
+  leading space** (`" CPU …"`) so its left edge aligns with the health line
+  (` Cluster:`) and the machine-stats line (` CPU`). It is a **supplementary** line:
+  `tick()` returns `""` (silent, no row) when there is no config or no snapshot yet
+  (the health line owns `connecting…`/`UNREACHABLE` messaging), and renders the
+  last-known line `dim` when the latest fetch failed.
+  Layout: ` CPU n% │ RAM n% <free>G free │ load x.x │ Ceph r/wM·ri/wio │
   Net ↓ ↑ │ ⚙ run/tot VMs`. Seeded automatically by `install.sh`'s generic loop.
 - **`ui/panels.py`** — pure formatters + thin `Static` widgets (no IO/parse on
   the render path). MRU: `format_mru_row`/`render_mru` + `MruFilesPanel`. Diff

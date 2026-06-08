@@ -2954,6 +2954,153 @@ class TestPageScrollKeys:
             )
 
 
+# ---------------------------------------------------------------------------
+# MRU keyboard selection — ↑/↓/PageUp/PageDown posts FileClicked (new feature)
+# ---------------------------------------------------------------------------
+
+
+class _SpyMruPanel(MruFilesPanel):
+    """Test-only subclass that records every posted message without side effects.
+
+    Overrides ``post_message`` (the *bus boundary*, not the logic under test)
+    to collect messages for assertion, while still calling super() so the
+    real dispatch path is preserved.  This is NOT a mock of the SUT; it is a
+    thin observation layer on an external-communication seam.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.posted: list = []
+
+    def post_message(self, message) -> bool:  # type: ignore[override]
+        self.posted.append(message)
+        return True  # mimic the real return without spinning up an event loop
+
+
+def _make_mru_panel(prefix: str, count: int) -> tuple:
+    """Return a populated (_SpyMruPanel, MruModel) with ``count`` entries."""
+    model = MruModel(AppConfig(mru_max=50))
+    for i in range(count):
+        model.record(
+            _file_event(
+                file_path=f"/repo/{prefix}_{i:02d}.py",
+                session_id=f"{prefix[:6]}{i:04d}abcd",
+                project_tag="proj",
+            )
+        )
+    panel = _SpyMruPanel()
+    panel.update_from_model(model)
+    return panel, model
+
+
+def _key_event(key: str):
+    """Minimal synthetic key event with a no-op stop() for on_key tests."""
+    return type("_KeyEvt", (), {"key": key, "stop": lambda self: None})()
+
+
+class TestMruKeyboardSelect:
+    """↑/↓ keys on MruFilesPanel post FileClicked for the row at _scroll_offset."""
+
+    def test_down_key_posts_file_clicked_with_correct_path(self):
+        """↓ scrolls by 1 and posts FileClicked for the new _scroll_offset row."""
+        panel, model = _make_mru_panel("kbsel", 4)
+        assert panel._scroll_offset == 0
+
+        panel.on_key(_key_event("down"))
+
+        assert panel._scroll_offset == 1
+        assert len(panel.posted) == 1
+        msg = panel.posted[0]
+        assert isinstance(msg, MruFilesPanel.FileClicked)
+        assert msg.file_path == panel._rows[1].file_path
+
+    def test_up_key_from_non_zero_offset_posts_file_clicked(self):
+        """↑ decrements offset and posts FileClicked for the row now at offset."""
+        panel, model = _make_mru_panel("kbsel", 4)
+        panel._scroll_mru(2)  # advance to offset 2
+        panel.posted.clear()
+
+        panel.on_key(_key_event("up"))
+
+        assert panel._scroll_offset == 1
+        assert len(panel.posted) == 1
+        msg = panel.posted[0]
+        assert isinstance(msg, MruFilesPanel.FileClicked)
+        assert msg.file_path == panel._rows[1].file_path
+
+    def test_up_key_at_offset_zero_posts_file_clicked_for_row_zero(self):
+        """↑ at offset 0 stays at 0 and posts FileClicked for rows()[0]."""
+        panel, model = _make_mru_panel("kbsel", 4)
+        assert panel._scroll_offset == 0
+
+        panel.on_key(_key_event("up"))
+
+        assert panel._scroll_offset == 0
+        assert len(panel.posted) == 1
+        assert panel.posted[0].file_path == panel._rows[0].file_path
+
+    def test_empty_panel_down_key_does_not_post_file_clicked(self):
+        """↓ on an empty panel (no rows) must NOT post FileClicked."""
+        panel = _SpyMruPanel()
+        panel.on_key(_key_event("down"))
+        assert panel.posted == []
+
+
+class TestMruKeyboardSelectPageDown:
+    """PageDown/PageUp keys post FileClicked for the row at _scroll_offset."""
+
+    def test_pagedown_posts_file_clicked_at_new_offset(self):
+        """PageDown scrolls by _page_step() and posts FileClicked."""
+        panel, model = _make_mru_panel("pgsel", 10)
+        # Force a known page step by placing enough rows and using a non-zero step.
+        # We rely on _scroll_mru's clamping so the offset after pagedown is valid.
+        panel.on_key(_key_event("pagedown"))
+
+        assert len(panel.posted) == 1
+        msg = panel.posted[0]
+        assert isinstance(msg, MruFilesPanel.FileClicked)
+        assert msg.file_path == panel._rows[panel._scroll_offset].file_path
+
+    def test_pageup_posts_file_clicked_at_new_offset(self):
+        """PageUp scrolls back and posts FileClicked for the row at new offset."""
+        panel, model = _make_mru_panel("pgsel", 10)
+        panel._scroll_mru(5)  # start in the middle
+        panel.posted.clear()
+
+        panel.on_key(_key_event("pageup"))
+
+        assert len(panel.posted) == 1
+        msg = panel.posted[0]
+        assert isinstance(msg, MruFilesPanel.FileClicked)
+        assert msg.file_path == panel._rows[panel._scroll_offset].file_path
+
+
+class TestMruMouseWheelNoSelect:
+    """Mouse wheel scroll on MruFilesPanel must NOT post FileClicked (scroll-only)."""
+
+    def test_mouse_scroll_down_does_not_post_file_clicked(self):
+        """on_mouse_scroll_down scrolls offset but must NOT post FileClicked."""
+        panel, model = _make_mru_panel("wheel", 6)
+        panel.on_mouse_scroll_down(None)
+        assert (
+            panel.posted == []
+        ), f"Wheel down must not post FileClicked; got {panel.posted}"
+        assert panel._scroll_offset == 1, "Wheel down must still scroll offset"
+
+    def test_mouse_scroll_up_does_not_post_file_clicked(self):
+        """on_mouse_scroll_up scrolls offset but must NOT post FileClicked."""
+        panel, model = _make_mru_panel("wheel", 6)
+        panel._scroll_mru(3)
+        panel.posted.clear()
+
+        panel.on_mouse_scroll_up(None)
+
+        assert (
+            panel.posted == []
+        ), f"Wheel up must not post FileClicked; got {panel.posted}"
+        assert panel._scroll_offset == 2, "Wheel up must still scroll offset"
+
+
 class TestTitleHighlightIntegration:
     """Integration: on_focus/on_blur re-render causes title highlight to follow focus."""
 

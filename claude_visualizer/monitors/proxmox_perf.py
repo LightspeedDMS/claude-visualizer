@@ -81,6 +81,11 @@ _PCT_CRIT_THRESHOLD = 80.0  # >= this → red
 _LOAD_WARN_FRACTION = 0.7  # >= this × cores → yellow
 _LOAD_CRIT_FRACTION = 1.0  # >= this × cores → red
 
+# Bar rendering (identical style to zzz_machine_stats)
+_BAR_WIDTH = 8
+_BAR_FILL = "█"
+_BAR_EMPTY = "░"
+
 # ---------------------------------------------------------------------------
 # Thread-safe SSL warning suppression guard
 # ---------------------------------------------------------------------------
@@ -128,13 +133,68 @@ class PerfSnapshot:
 # ---------------------------------------------------------------------------
 
 
-def _fmt_bps(bps: float) -> str:
-    """Format bytes/s as human-readable string: e.g. '10.0M', '1.2k', '0'."""
-    if bps >= _BYTES_PER_MIB:
-        return f"{bps / _BYTES_PER_MIB:.1f}M"
-    if bps >= _BYTES_PER_KIB:
-        return f"{bps / _BYTES_PER_KIB:.1f}k"
-    return f"{bps:.0f}"
+def _bar_colour(pct: float) -> str:
+    """Map a utilisation percentage to a Rich color name (for bar fill)."""
+    if pct >= _PCT_CRIT_THRESHOLD:
+        return "red"
+    if pct >= _PCT_WARN_THRESHOLD:
+        return "yellow"
+    return "green"
+
+
+def _render_bar(out: "Text", pct: float) -> None:
+    """Append a 12-char bar to out, colored by percentage."""
+    filled = min(_BAR_WIDTH, round(_BAR_WIDTH * pct / 100))
+    out.append(
+        _BAR_FILL * filled + _BAR_EMPTY * (_BAR_WIDTH - filled),
+        style=_bar_colour(pct),
+    )
+
+
+def _fmt_rate(bps: float) -> str:
+    """Format a byte rate as a 7-char left-padded human-readable string (matches machine stats)."""
+    if bps < 1024:
+        s = f"{int(bps)}B/s"
+    elif bps < 1024**2:
+        val = bps / 1024
+        s = f"{val:.1f}K/s" if val < 100 else f"{val:.0f}K/s"
+    elif bps < 1024**3:
+        val = bps / 1024**2
+        s = f"{val:.1f}M/s" if val < 100 else f"{val:.0f}M/s"
+    else:
+        val = bps / 1024**3
+        s = f"{val:.1f}G/s" if val < 100 else f"{val:.0f}G/s"
+    return s.ljust(7)
+
+
+_BYTES_PER_TIB = 1024**4
+
+
+def _fmt_ceph_bps(bps: float) -> str:
+    """Format Ceph throughput as a 6-char right-justified string.
+
+    Tiers (largest first so large values render compactly):
+      >= 1 TiB/s → X.Xt or XXXt   (fits in 6 chars for sane values)
+      >= 1 GiB/s → X.XG or XXXG
+      >= 1 MiB/s → X.XM or XXXM
+      >= 1 KiB/s → X.Xk or XXXk
+      otherwise  → integer bytes
+    """
+    if bps >= _BYTES_PER_TIB:
+        val = bps / _BYTES_PER_TIB
+        s = f"{val:.1f}T" if val < 100 else f"{val:.0f}T"
+    elif bps >= _BYTES_PER_GIB:
+        val = bps / _BYTES_PER_GIB
+        s = f"{val:.1f}G" if val < 100 else f"{val:.0f}G"
+    elif bps >= _BYTES_PER_MIB:
+        val = bps / _BYTES_PER_MIB
+        s = f"{val:.1f}M" if val < 100 else f"{val:.0f}M"
+    elif bps >= _BYTES_PER_KIB:
+        val = bps / _BYTES_PER_KIB
+        s = f"{val:.1f}k" if val < 100 else f"{val:.0f}k"
+    else:
+        s = f"{bps:.0f}"
+    return s.rjust(6)
 
 
 def _pct_color(pct: float) -> str:
@@ -160,23 +220,28 @@ def _load_color(load: float, cores: int) -> str:
 def render_perf_bar(snap: PerfSnapshot, *, stale: bool = False) -> Text:
     """Render the one-line cluster performance bar as a Rich Text.
 
-    Layout uses fixed-width numeric fields to prevent jitter:
-        CPU  57% │ RAM  44%  36.0G free │ load  2.0 │ Ceph … │ Net … │ ⚙ run/tot VMs
+    Layout uses fixed-width numeric fields and visual bars to prevent jitter:
+        CPU ██░░░░░░  57% │ RAM ████░░░░  44%  36.0G free │ load   2.0 │
+        Ceph r:  10.0M w:  20.0M · r:   100 w:   200 io/s │ Net ↓ 8.8K/s  ↑11.7K/s  │ ⚙  3/ 5 VMs
 
     stale=True: entire line rendered dim (fetch failed, prior data shown).
     """
     out = Text(no_wrap=True, overflow="ellipsis")
-    ram_free_gib = snap.ram_free_bytes / _BYTES_PER_GIB
 
-    # CPU — fixed 3-char width so 'RAM' position never shifts
-    out.append("CPU ")
-    out.append(f"{snap.cpu_pct:3.0f}%", style=_pct_color(snap.cpu_pct))
+    # free RAM: right-justify to 6 chars (covers "0.0G" … "999.9G")
+    ram_free_gib = snap.ram_free_bytes / _BYTES_PER_GIB
+    free_str = f"{ram_free_gib:.1f}G"
+
+    out.append(" CPU ")
+    _render_bar(out, snap.cpu_pct)
+    out.append(f" {snap.cpu_pct:>3.0f}%")
     out.append(" │ ")
 
     # RAM
     out.append("RAM ")
-    out.append(f"{snap.ram_pct:3.0f}%", style=_pct_color(snap.ram_pct))
-    out.append(f"  {ram_free_gib:.1f}G free")
+    _render_bar(out, snap.ram_pct)
+    out.append(f" {snap.ram_pct:>3.0f}%")
+    out.append(f"  {free_str:>6} free")
     out.append(" │ ")
 
     # Load average
@@ -187,20 +252,25 @@ def render_perf_bar(snap: PerfSnapshot, *, stale: bool = False) -> Text:
     )
     out.append(" │ ")
 
-    # Ceph throughput + IOPS
-    out.append("Ceph ")
-    out.append(f"{_fmt_bps(snap.ceph_read_bps)}/{_fmt_bps(snap.ceph_write_bps)}")
-    out.append("·")
-    out.append(f"{snap.ceph_read_iops:4.0f}/{snap.ceph_write_iops:4.0f}")
+    # Ceph throughput (r:/w: prefixes, fixed 6-char right-justified values)
+    out.append("Ceph r:")
+    out.append(_fmt_ceph_bps(snap.ceph_read_bps))
+    out.append(" w:")
+    out.append(_fmt_ceph_bps(snap.ceph_write_bps))
+
+    # Ceph IOPS (r:/w: prefixes, fixed 5-char right-justified, "io/s" suffix)
+    out.append(" · r:")
+    out.append(f"{snap.ceph_read_iops:5.0f}")
+    out.append(" w:")
+    out.append(f"{snap.ceph_write_iops:5.0f}")
+    out.append(" io/s")
     out.append(" │ ")
 
-    # Network
-    out.append("Net ")
-    out.append("↓")
-    out.append(_fmt_bps(snap.net_in_bps))
-    out.append(" ")
-    out.append("↑")
-    out.append(_fmt_bps(snap.net_out_bps))
+    # Network — _fmt_rate produces 7-char padded string (matching machine stats)
+    out.append("Net ↓")
+    out.append(_fmt_rate(snap.net_in_bps))
+    out.append(" ↑")
+    out.append(_fmt_rate(snap.net_out_bps))
     out.append(" │ ")
 
     # VM counts
@@ -349,6 +419,20 @@ class Monitor:
         if self._config is not None and not self._config.verify_ssl:
             _suppress_ssl_warnings_once()
 
+        # Perf-specific poll interval — separate from the shared poll_interval_seconds
+        # so the perf bar updates ~1s while the health monitor stays at 30s.
+        self._poll_interval_seconds: float = 1.0
+        if self._config is not None:
+            try:
+                import yaml  # already a dep (proxmox_cluster imports it)
+
+                raw = yaml.safe_load(_path.read_text()) or {}
+                self._poll_interval_seconds = max(
+                    0.1, float(raw.get("perf_poll_interval_seconds", 1.0))
+                )
+            except Exception:
+                self._poll_interval_seconds = 1.0
+
         self._snapshot: Optional[PerfSnapshot] = None
         self._last_poll: float = 0.0
         self._polled_once: bool = False
@@ -398,7 +482,7 @@ class Monitor:
 
         # Submit a new fetch if due and none in-flight
         should_poll = not self._polled_once or (
-            now - self._last_poll >= self._config.poll_interval_seconds
+            now - self._last_poll >= self._poll_interval_seconds
         )
         if should_poll and self._in_flight is None:
             self._in_flight = self._submit_fetch()
