@@ -96,11 +96,12 @@ def _write_tool_line(
     session_id: str = "sessAAAA1111",
     cwd: str = "/home/dev/my-project",
     model: str = "claude-opus-4-5",
+    timestamp: str = "2024-01-15T10:00:00.000Z",
 ) -> str:
     return json.dumps(
         {
             "type": "assistant",
-            "timestamp": "2024-01-15T10:00:00.000Z",
+            "timestamp": timestamp,
             "sessionId": session_id,
             "cwd": cwd,
             "message": {
@@ -337,9 +338,12 @@ class TestRenderMru:
 
     def test_rows_rendered_newest_first(self):
         model = MruModel(AppConfig(mru_max=10))
-        # record a, then b → b should appear before a (newest-first).
-        for path, sess in (("/r/a.py", "aaaa0000"), ("/r/b.py", "bbbb1111")):
-            model.record(_file_event(file_path=path, session_id=sess))
+        # Explicit distinct timestamps so the timestamp sort is deterministic:
+        # b.py (13:45:08) is newer than a.py (13:45:07) → b appears first.
+        t_a = datetime(2024, 1, 2, 13, 45, 7, tzinfo=timezone.utc)
+        t_b = datetime(2024, 1, 2, 13, 45, 8, tzinfo=timezone.utc)
+        model.record(_file_event(file_path="/r/a.py", session_id="aaaa0000", ts=t_a))
+        model.record(_file_event(file_path="/r/b.py", session_id="bbbb1111", ts=t_b))
         # render_mru now returns a Rich Text (colours the highlighted row);
         # assert ordering against its plain string.
         text = render_mru(model).plain
@@ -384,11 +388,14 @@ class TestRenderMru:
     def test_highlighted_odd_row_uses_highlight_not_zebra(self):
         # When an odd row is highlighted, MRU_HIGHLIGHT_STYLE replaces the zebra
         # tint: no zebra span present, and the highlight span IS present.
+        # Explicit timestamps so a.py (older) sorts to index 1 (odd) reliably.
         from claude_visualizer.ui.panels import MRU_HIGHLIGHT_STYLE
 
+        t_old = datetime(2024, 1, 2, 13, 45, 7, tzinfo=timezone.utc)
+        t_new = datetime(2024, 1, 2, 13, 45, 8, tzinfo=timezone.utc)
         model = MruModel(AppConfig(mru_max=10))
-        model.record(_file_event(file_path="/r/a.py"))  # row 1 (odd)
-        model.record(_file_event(file_path="/r/b.py"))  # row 0 (even, newest)
+        model.record(_file_event(file_path="/r/a.py", ts=t_old))  # row 1 (odd)
+        model.record(_file_event(file_path="/r/b.py", ts=t_new))  # row 0 (even, newest)
         model.highlighted_path = "/r/a.py"
         text = render_mru(model)
         zebra = [s for s in text.spans if MRU_ROW_STYLE_ODD in str(s.style)]
@@ -411,15 +418,22 @@ class TestRenderMru:
     def test_long_path_padded_to_next_width_multiple(self):
         """A path longer than panel width gets padded to the next multiple of
         width so every wrapped visual line has a full-width background span."""
+        # Explicit timestamps so the long-path entry (older) sorts to index 1
+        # (odd, zebra) and /r/b.py (newer) sorts to index 0 (even) reliably.
+        t_old = datetime(2024, 1, 2, 13, 45, 7, tzinfo=timezone.utc)
+        t_new = datetime(2024, 1, 2, 13, 45, 8, tzinfo=timezone.utc)
         model = MruModel(AppConfig(mru_max=10))
         # Record two entries so the second (odd) row gets a zebra span — the
-        # long path is the FIRST recorded (oldest) so it ends up at index 1 (odd).
+        # long path is older so it ends up at index 1 (odd).
         model.record(
             _file_event(
-                file_path="/very/long/path/that/exceeds/panel/width/filename.py"
+                file_path="/very/long/path/that/exceeds/panel/width/filename.py",
+                ts=t_old,
             )
         )
-        model.record(_file_event(file_path="/r/b.py"))  # newest → index 0 (even)
+        model.record(
+            _file_event(file_path="/r/b.py", ts=t_new)
+        )  # newest → index 0 (even)
         # Use width=20 so the long path row (index 1 = odd) exceeds 1 visual line.
         text = render_mru(model, width=20)
         plain = text.plain
@@ -1073,7 +1087,8 @@ class TestMruClick:
             mru_panel = pilot.app.query_one(MruFilesPanel)
             diff_panel = pilot.app.query_one(DiffPanel)
 
-            # file_a appended first → entry 1 (older) in the MRU list
+            # file_a appended first → entry 1 (older) in the MRU list.
+            # Explicit earlier timestamp so it sorts to index 1 deterministically.
             _append_line(
                 session,
                 _write_tool_line(
@@ -1085,10 +1100,12 @@ class TestMruClick:
                     },
                     session_id="wrapSESS1234",
                     cwd="/home/dev/wp",
+                    timestamp="2024-01-15T10:00:00.000Z",
                 ),
             )
             # file_b appended second → entry 0 (newest); intentionally long so
-            # its row wraps to ≥2 physical lines at content_width≈38
+            # its row wraps to ≥2 physical lines at content_width≈38.
+            # Explicit later timestamp so it sorts to index 0 deterministically.
             file_b = "/repo/a_longer_path_for_wrap_testing.py"
             _append_line(
                 session,
@@ -1097,6 +1114,7 @@ class TestMruClick:
                     {"file_path": file_b, "old_string": "b=1", "new_string": "b=2"},
                     session_id="wrapSESS1234",
                     cwd="/home/dev/wp",
+                    timestamp="2024-01-15T10:00:01.000Z",
                 ),
             )
 

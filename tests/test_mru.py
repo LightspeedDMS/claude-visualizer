@@ -166,16 +166,20 @@ class TestTimestamp:
 
 class TestOrdering:
     def test_two_distinct_files_newest_first(self):
+        # Explicit timestamps so the sort is deterministic regardless of wall clock.
+        t1 = datetime(2025, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
+        t2 = datetime(2025, 1, 1, 10, 0, 1, tzinfo=timezone.utc)
         model = MruModel(AppConfig())
-        model.record(_evt(file_path="/a.py"))
-        model.record(_evt(file_path="/b.py"))
+        model.record(_evt(file_path="/a.py", ts=t1))
+        model.record(_evt(file_path="/b.py", ts=t2))
         rows = model.rows()
         assert [r.file_path for r in rows] == ["/b.py", "/a.py"]
 
     def test_three_files_ordering(self):
         model = MruModel(AppConfig())
-        for path in ("/a.py", "/b.py", "/c.py"):
-            model.record(_evt(file_path=path))
+        for i, path in enumerate(("/a.py", "/b.py", "/c.py")):
+            ts = datetime(2025, 1, 1, 10, 0, i, tzinfo=timezone.utc)
+            model.record(_evt(file_path=path, ts=ts))
         assert [r.file_path for r in model.rows()] == ["/c.py", "/b.py", "/a.py"]
 
 
@@ -192,12 +196,18 @@ class TestDedupMoveToFront:
         assert len(model.rows()) == 1
 
     def test_repeat_moves_to_front(self):
+        # Explicit timestamps: t1 < t2 < t3 < t4 so the second /a.py touch
+        # (t4 = newest) sorts first, /c.py (t3) second, /b.py (t2) last.
+        t1 = datetime(2025, 1, 1, 10, 0, 1, tzinfo=timezone.utc)
+        t2 = datetime(2025, 1, 1, 10, 0, 2, tzinfo=timezone.utc)
+        t3 = datetime(2025, 1, 1, 10, 0, 3, tzinfo=timezone.utc)
+        t4 = datetime(2025, 1, 1, 10, 0, 4, tzinfo=timezone.utc)
         model = MruModel(AppConfig())
-        model.record(_evt(file_path="/a.py"))
-        model.record(_evt(file_path="/b.py"))
-        model.record(_evt(file_path="/c.py"))
-        # Touch /a.py again → it should jump to the front.
-        model.record(_evt(file_path="/a.py"))
+        model.record(_evt(file_path="/a.py", ts=t1))
+        model.record(_evt(file_path="/b.py", ts=t2))
+        model.record(_evt(file_path="/c.py", ts=t3))
+        # Touch /a.py again with a newer timestamp → it should sort to the front.
+        model.record(_evt(file_path="/a.py", ts=t4))
         assert [r.file_path for r in model.rows()] == ["/a.py", "/c.py", "/b.py"]
 
     def test_repeat_updates_origin_fields(self):
@@ -229,22 +239,36 @@ class TestCapacityFalloff:
         assert len(model.rows()) == 3
 
     def test_oldest_falls_off(self):
+        # Explicit timestamps: t1 < t2 < t3 < t4 so /a.py (t1) is LRU → evicted,
+        # and the remaining rows sort: /d.py (t4), /c.py (t3), /b.py (t2).
+        timestamps = [
+            datetime(2025, 1, 1, 10, 0, i, tzinfo=timezone.utc) for i in range(1, 5)
+        ]
         model = MruModel(AppConfig(mru_max=3))
-        for path in ("/a.py", "/b.py", "/c.py", "/d.py"):
-            model.record(_evt(file_path=path))
+        for path, ts in zip(("/a.py", "/b.py", "/c.py", "/d.py"), timestamps):
+            model.record(_evt(file_path=path, ts=ts))
         # /a.py is the least-recently-used → evicted.
         paths = [r.file_path for r in model.rows()]
         assert "/a.py" not in paths
         assert paths == ["/d.py", "/c.py", "/b.py"]
 
     def test_move_to_front_protects_from_falloff(self):
+        # Explicit timestamps: t1..t5 monotonically increasing.
+        # /a.py recorded at t1, /b.py at t2, /c.py at t3, /a.py again at t4,
+        # /d.py at t5. LRU eviction is by arrival order (OrderedDict), so /b.py
+        # (arrival-oldest after /a.py was moved) is evicted, not /a.py.
+        t1 = datetime(2025, 1, 1, 10, 0, 1, tzinfo=timezone.utc)
+        t2 = datetime(2025, 1, 1, 10, 0, 2, tzinfo=timezone.utc)
+        t3 = datetime(2025, 1, 1, 10, 0, 3, tzinfo=timezone.utc)
+        t4 = datetime(2025, 1, 1, 10, 0, 4, tzinfo=timezone.utc)
+        t5 = datetime(2025, 1, 1, 10, 0, 5, tzinfo=timezone.utc)
         model = MruModel(AppConfig(mru_max=3))
-        model.record(_evt(file_path="/a.py"))
-        model.record(_evt(file_path="/b.py"))
-        model.record(_evt(file_path="/c.py"))
+        model.record(_evt(file_path="/a.py", ts=t1))
+        model.record(_evt(file_path="/b.py", ts=t2))
+        model.record(_evt(file_path="/c.py", ts=t3))
         # Re-touch /a.py so it is now most-recent, then push a new file.
-        model.record(_evt(file_path="/a.py"))
-        model.record(_evt(file_path="/d.py"))
+        model.record(_evt(file_path="/a.py", ts=t4))
+        model.record(_evt(file_path="/d.py", ts=t5))
         paths = [r.file_path for r in model.rows()]
         # /b.py was the least-recently-used and should be evicted, not /a.py.
         assert "/a.py" in paths
@@ -278,3 +302,99 @@ class TestRowsSnapshot:
         rows.clear()
         # Internal state must be unaffected by mutating the returned list.
         assert len(model.rows()) == 1
+
+
+# ---------------------------------------------------------------------------
+# rows() — timestamp-based display ordering (cross-session interleave fix)
+# ---------------------------------------------------------------------------
+
+
+class TestRowsTimestampOrdering:
+    def test_rows_sorted_by_timestamp_not_arrival(self):
+        """Events arriving out-of-timestamp-order are displayed by timestamp.
+
+        Simulates: session A's tailer drains two events (18:09, 18:27),
+        then session B's tailer drains one event (18:24).
+        Arrival order: 18:09, 18:27, 18:24
+        Expected display order: 18:27, 18:24, 18:09
+        """
+        model = MruModel(AppConfig())
+
+        ev1 = FileModifiedEvent(
+            file_path="/a/early.py",
+            op=FileOp.EDIT,
+            session_id="sess-aaa",
+            project_tag="projA",
+            is_subagent=False,
+            source_path="/src/a.jsonl",
+            old_string="x",
+            new_string="y",
+            ts=datetime(2025, 1, 1, 18, 9, 56, tzinfo=timezone.utc),
+        )
+        ev2 = FileModifiedEvent(
+            file_path="/a/latest.py",
+            op=FileOp.EDIT,
+            session_id="sess-aaa",
+            project_tag="projA",
+            is_subagent=False,
+            source_path="/src/a.jsonl",
+            old_string="x",
+            new_string="y",
+            ts=datetime(2025, 1, 1, 18, 27, 2, tzinfo=timezone.utc),
+        )
+        ev3 = FileModifiedEvent(
+            file_path="/b/middle.py",
+            op=FileOp.EDIT,
+            session_id="sess-bbb",
+            project_tag="projB",
+            is_subagent=False,
+            source_path="/src/b.jsonl",
+            old_string="x",
+            new_string="y",
+            ts=datetime(2025, 1, 1, 18, 24, 11, tzinfo=timezone.utc),
+        )
+
+        model.record(ev1)  # arrives first (18:09)
+        model.record(ev2)  # arrives second (18:27)
+        model.record(ev3)  # arrives third (18:24)
+
+        rows = model.rows()
+        assert len(rows) == 3
+        # Display order must be by timestamp descending: 18:27, 18:24, 18:09
+        assert rows[0].file_path == "/a/latest.py"  # 18:27
+        assert rows[1].file_path == "/b/middle.py"  # 18:24
+        assert rows[2].file_path == "/a/early.py"  # 18:09
+
+    def test_rows_none_ts_sorts_to_end(self):
+        """Entries with ts=None appear after all timestamped entries."""
+        model = MruModel(AppConfig())
+
+        ev_with_ts = FileModifiedEvent(
+            file_path="/a/timestamped.py",
+            op=FileOp.EDIT,
+            session_id="sess-aaa",
+            project_tag="projA",
+            is_subagent=False,
+            source_path="/src/a.jsonl",
+            old_string="x",
+            new_string="y",
+            ts=datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        )
+        ev_no_ts = FileModifiedEvent(
+            file_path="/b/no_timestamp.py",
+            op=FileOp.EDIT,
+            session_id="sess-bbb",
+            project_tag="projB",
+            is_subagent=False,
+            source_path="/src/b.jsonl",
+            old_string="x",
+            new_string="y",
+            ts=None,
+        )
+
+        model.record(ev_no_ts)
+        model.record(ev_with_ts)
+
+        rows = model.rows()
+        assert rows[0].file_path == "/a/timestamped.py"  # has ts → first
+        assert rows[1].file_path == "/b/no_timestamp.py"  # None → last

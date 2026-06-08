@@ -83,5 +83,20 @@ class MruModel:
         return entry
 
     def rows(self) -> List[MruEntry]:
-        """Return entries newest-first as a fresh list (safe to mutate)."""
-        return list(reversed(self._entries.values()))
+        """Return entries newest-first by timestamp as a fresh list (safe to mutate).
+
+        Sorted by ``ts`` descending so the display is chronological regardless
+        of the order the pipeline drained events from multiple sessions.
+        Entries with ``ts=None`` (un-timestamped) sort to the end.
+
+        The sort key is a 2-tuple ``(has_ts, ts)`` — both fields are reversed,
+        so ``True`` (has a timestamp) sorts before ``False`` (no timestamp), and
+        among timestamped entries the latest ``ts`` sorts first.  This avoids
+        any comparison between timezone-aware and timezone-naive datetimes.
+        """
+        entries = list(self._entries.values())
+        entries.sort(
+            key=lambda e: (e.ts is not None, e.ts),
+            reverse=True,
+        )
+        return entries
