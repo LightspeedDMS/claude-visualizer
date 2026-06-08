@@ -646,7 +646,7 @@ def render_monitor_bar(lines: list) -> Text:
     Textual height gotcha).
     """
     active = _filter_active_monitor_lines(lines)
-    out = Text()
+    out = Text(no_wrap=True, overflow="ellipsis")
     for i, line in enumerate(active):
         if isinstance(line, Text):
             out.append_text(line)

@@ -1614,6 +1614,130 @@ class TestMonitorBarWidget:
 
 
 # ---------------------------------------------------------------------------
+# MonitorBar no-wrap regression — long lines must NOT wrap to extra rows
+# ---------------------------------------------------------------------------
+
+
+class TestMonitorBarNoWrap:
+    """Regression guard: render_monitor_bar must never wrap long lines.
+
+    A long monitor line (> terminal width) must be clipped to the terminal
+    width with an ellipsis, NOT wrapped to an extra row.  Before the fix
+    (``out = Text()``), render_lines would produce 3 visual rows for a 2-monitor
+    feed when one line exceeded 40 chars — the wrapped row pushed the second
+    monitor off-screen.  After the fix (``out = Text(no_wrap=True,
+    overflow="ellipsis")``), render_lines produces exactly 2 rows, the first
+    cropped to ``≤ width`` characters ending in ``…``.
+    """
+
+    def test_nowrap_long_line_clips_to_width(self) -> None:
+        """render_monitor_bar at a narrow Console width → 2 rows, long one cropped.
+
+        This is the deterministic regression guard.  Against the old
+        ``out = Text()`` it would produce 3 rows; with the fix it produces 2.
+        """
+        from rich.console import Console
+
+        long_line = "A" * 60  # 60 chars, well past width=40
+        result = render_monitor_bar([long_line, "SECOND-MONITOR"])
+
+        console = Console(width=40, highlight=False, no_color=True)
+        rows = console.render_lines(result, console.options.update(width=40), pad=False)
+
+        # Must be exactly 2 visual rows — one per monitor, no wrap-overflow.
+        assert len(rows) == 2, (
+            f"Expected 2 visual rows (one per monitor) but got {len(rows)}. "
+            f"A plain Text() would wrap the long line to an extra row. "
+            f"Rows: {[repr(''.join(s.text for s in r)) for r in rows]}"
+        )
+
+        # First row must be cropped to ≤ 40 cells (Rich's ellipsis clips at width).
+        first_row_text = "".join(s.text for s in rows[0])
+        assert (
+            len(first_row_text) <= 40
+        ), f"Long row must be ≤ 40 chars; got {len(first_row_text)}: {first_row_text!r}"
+        # The crop indicator is the Rich ellipsis character.
+        assert first_row_text.endswith(
+            "…"
+        ), f"Cropped row must end with '…'; got: {first_row_text!r}"
+
+        # Second row must contain the short monitor marker.
+        second_row_text = "".join(s.text for s in rows[1])
+        assert (
+            "SECOND-MONITOR" in second_row_text
+        ), f"Second row must contain 'SECOND-MONITOR'; got: {second_row_text!r}"
+
+
+# ---------------------------------------------------------------------------
+# MonitorBar UI — both monitors survive a narrow terminal (run_test harness)
+# ---------------------------------------------------------------------------
+
+
+class TestMonitorBarNarrowTerminal:
+    """Real app harness: both monitors visible after layout at narrow width.
+
+    Seeds a temp monitors_dir with two fixture monitors — one that returns
+    a very long string, one that returns a short marker — boots the real
+    VisualizerApp at ``size=(40, 12)`` and asserts:
+    - Both monitors' content is present in MonitorBar.rendered_text() (content check).
+    - The MonitorBar rendered text has exactly 2 lines (no wrap-overflow row).
+
+    No network calls: fixture monitors do pure string arithmetic only.
+    """
+
+    async def test_both_monitors_survive_narrow_terminal(self, tmp_path: Path) -> None:
+        """MonitorBar shows both monitors without wrap when one line is long."""
+        # Create two fixture monitor .py files in a dedicated monitors_dir.
+        monitors_dir = tmp_path / "monitors"
+        monitors_dir.mkdir(parents=True, exist_ok=True)
+
+        # Monitor A: returns a long line (70 chars), exceeds width=40.
+        long_content = "LONG-MON:" + "X" * 61  # 70 chars total
+        (monitors_dir / "aaa_long_monitor.py").write_text(
+            f"class Monitor:\n"
+            f"    def tick(self, now):\n"
+            f"        return {long_content!r}\n"
+        )
+
+        # Monitor B: returns a short marker, should always be visible.
+        (monitors_dir / "bbb_short_monitor.py").write_text(
+            "class Monitor:\n"
+            "    def tick(self, now):\n"
+            "        return 'SHORT-MON-MARKER'\n"
+        )
+
+        root = tmp_path / "projects"
+        cfg = _fixture_config(root, monitors_dir=monitors_dir)
+        app = VisualizerApp(cfg)
+
+        async with app.run_test(size=(40, 12)) as pilot:
+            # Pump until MonitorBar is visible with both monitors' data.
+            bar = pilot.app.query_one(MonitorBar)
+            for _ in range(40):
+                await pilot.pause()
+                text = bar.rendered_text()
+                if "LONG-MON" in text and "SHORT-MON-MARKER" in text:
+                    break
+
+            bar_text = bar.rendered_text()
+
+            # Both monitors must be present.
+            assert (
+                "LONG-MON" in bar_text
+            ), f"Long monitor must appear in MonitorBar; got: {bar_text!r}"
+            assert (
+                "SHORT-MON-MARKER" in bar_text
+            ), f"Short monitor must appear in MonitorBar; got: {bar_text!r}"
+
+            # Exactly 2 lines — the long line must NOT have wrapped to an extra row.
+            lines = bar_text.splitlines()
+            assert len(lines) == 2, (
+                f"MonitorBar must show exactly 2 lines (one per monitor, no wrap); "
+                f"got {len(lines)}: {lines!r}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Regression: _fixture_config must not point at the real monitors directory
 # ---------------------------------------------------------------------------
 
