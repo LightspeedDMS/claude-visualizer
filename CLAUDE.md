@@ -224,6 +224,7 @@ Routing is by event type: `FileModifiedEvent` → MRU + diff queue; `CommandEven
   `DiffScrolled(±1)` which the app forwards to `DiffQueueModel.scroll_pin_by()` —
   a no-op unless pinned, so **`↑`/`↓` scroll the Diff ONLY when pinned** (same
   rule as the wheel; press `p` or click an MRU row to pin).
+- **`PageUp`/`PageDown` scroll the focused panel by ~a screenful** (`_page_step()` = `content_size.height − _PANEL_TITLE_CHROME`), same focused/pinned rules as `↑`/`↓` (Diff pages only when pinned).
 - **Commands autoscroll-follow.** `CommandsPanel` holds `_scroll_offset` +
   `_follow` (+ `_last_model`/`_last_width` for re-render). `render_commands`
   renders `rows[scroll_offset:]` (rows are newest-first → offset 0 = newest at

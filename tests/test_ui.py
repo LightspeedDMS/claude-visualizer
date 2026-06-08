@@ -2694,6 +2694,266 @@ class TestTitleHighlightPure:
         assert not _has_reverse_on_title(text, COMMANDS_TITLE)
 
 
+class TestPageScrollKeys:
+    """PageUp/PageDown scroll the focused panel by ~a screenful (_page_step).
+
+    Anti-mock: real run_test + pilot.press.  Each test seeds MORE than one
+    screenful of rows so there is guaranteed room to page.
+    """
+
+    async def test_mru_pagedown_jumps_more_than_one_row(self, tmp_path: Path):
+        """PageDown on focused MRU jumps _scroll_offset by more than 1 row."""
+        root = tmp_path / "projects"
+        session = root / "proj" / "mru_page.jsonl"
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            # Seed 30 entries so there is more than a screenful to page through.
+            for i in range(30):
+                _append_line(
+                    session,
+                    _write_tool_line(
+                        "Write",
+                        {"file_path": f"/repo/pg_{i:02d}.py", "content": "x"},
+                        session_id=f"pgSESS{i:04d}",
+                        cwd="/home/dev/pgproj",
+                    ),
+                )
+            await _pump(pilot, "/repo/pg_29.py")
+
+            mru = pilot.app.query_one(MruFilesPanel)
+            mru.focus()
+            await pilot.pause()
+
+            # One single ↓ step.
+            before_down = mru._scroll_offset
+            await pilot.press("down")
+            await pilot.pause()
+            single_step = mru._scroll_offset - before_down
+            assert single_step == 1, f"Expected single step=1, got {single_step}"
+
+            # Reset to 0 then measure pagedown jump.
+            mru._scroll_offset = 0
+            await pilot.press("pagedown")
+            await pilot.pause()
+            page_jump = mru._scroll_offset
+            assert (
+                page_jump > 1
+            ), f"pagedown must jump by more than 1 row; got _scroll_offset={page_jump}"
+
+    async def test_mru_pageup_returns_toward_zero(self, tmp_path: Path):
+        """PageUp on focused MRU decreases _scroll_offset, floored at 0."""
+        root = tmp_path / "projects"
+        session = root / "proj" / "mru_pageup.jsonl"
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            for i in range(30):
+                _append_line(
+                    session,
+                    _write_tool_line(
+                        "Write",
+                        {"file_path": f"/repo/pu_{i:02d}.py", "content": "x"},
+                        session_id=f"puSESS{i:04d}",
+                        cwd="/home/dev/puproj",
+                    ),
+                )
+            await _pump(pilot, "/repo/pu_29.py")
+
+            mru = pilot.app.query_one(MruFilesPanel)
+            mru.focus()
+            await pilot.pause()
+
+            # Page down first so there is room to page up.
+            await pilot.press("pagedown")
+            await pilot.pause()
+            after_down = mru._scroll_offset
+            assert after_down > 0, "pagedown must advance from 0"
+
+            # PageUp must bring offset back toward 0.
+            await pilot.press("pageup")
+            await pilot.pause()
+            after_up = mru._scroll_offset
+            assert after_up < after_down, (
+                f"pageup must decrease _scroll_offset; after_down={after_down}, "
+                f"after_up={after_up}"
+            )
+
+            # PageUp at 0 must not go negative.
+            mru._scroll_offset = 0
+            await pilot.press("pageup")
+            await pilot.pause()
+            assert mru._scroll_offset == 0, "pageup at offset 0 must stay at 0"
+
+    async def test_commands_pagedown_jumps_more_than_one_row(self, tmp_path: Path):
+        """PageDown on focused Commands panel jumps _scroll_offset by more than 1."""
+        root = tmp_path / "projects"
+        session = root / "proj" / "cmd_page.jsonl"
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            for i in range(30):
+                _append_line(
+                    session,
+                    _write_tool_line(
+                        "Bash",
+                        {"command": f"cmd-page-{i:02d}"},
+                        session_id=f"cmdPG{i:04d}",
+                        cwd="/home/dev/cmdpgproj",
+                    ),
+                )
+            await _pump_commands(pilot, "cmd-page-29")
+
+            cmd_panel = pilot.app.query_one(CommandsPanel)
+            cmd_panel.focus()
+            await pilot.pause()
+
+            # One single ↓ step.
+            before_down = cmd_panel._scroll_offset
+            await pilot.press("down")
+            await pilot.pause()
+            single_step = cmd_panel._scroll_offset - before_down
+            assert single_step == 1, f"Expected single step=1, got {single_step}"
+
+            # Reset to 0 then measure pagedown jump.
+            cmd_panel._scroll_offset = 0
+            cmd_panel._follow = False
+            await pilot.press("pagedown")
+            await pilot.pause()
+            page_jump = cmd_panel._scroll_offset
+            assert (
+                page_jump > 1
+            ), f"pagedown must jump more than 1 row; got _scroll_offset={page_jump}"
+
+    async def test_commands_pageup_returns_toward_zero(self, tmp_path: Path):
+        """PageUp on focused Commands panel decreases _scroll_offset, floored at 0."""
+        root = tmp_path / "projects"
+        session = root / "proj" / "cmd_pageup.jsonl"
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            for i in range(30):
+                _append_line(
+                    session,
+                    _write_tool_line(
+                        "Bash",
+                        {"command": f"cmd-pu-{i:02d}"},
+                        session_id=f"cmdPU{i:04d}",
+                        cwd="/home/dev/cmdpuproj",
+                    ),
+                )
+            await _pump_commands(pilot, "cmd-pu-29")
+
+            cmd_panel = pilot.app.query_one(CommandsPanel)
+            cmd_panel.focus()
+            await pilot.pause()
+
+            # Page down first so there is room to page up.
+            cmd_panel._scroll_offset = 0
+            cmd_panel._follow = False
+            await pilot.press("pagedown")
+            await pilot.pause()
+            after_down = cmd_panel._scroll_offset
+            assert after_down > 0, "pagedown must advance from 0"
+
+            # PageUp must bring offset back toward 0.
+            await pilot.press("pageup")
+            await pilot.pause()
+            after_up = cmd_panel._scroll_offset
+            assert after_up < after_down, (
+                f"pageup must decrease _scroll_offset; after_down={after_down}, "
+                f"after_up={after_up}"
+            )
+
+            # PageUp at 0 must stay at 0.
+            cmd_panel._scroll_offset = 0
+            await pilot.press("pageup")
+            await pilot.pause()
+            assert cmd_panel._scroll_offset == 0, "pageup at offset 0 must stay at 0"
+
+    async def test_diff_pagedown_noop_when_unpinned(self, tmp_path: Path):
+        """PageDown on Diff panel does nothing when unpinned (same rule as ↓)."""
+        root = tmp_path / "projects"
+        session = root / "proj" / "diff_pg_unpin.jsonl"
+        clock = _ManualClock()
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg, now=clock)
+        async with app.run_test(size=(120, 40)) as pilot:
+            tall_content = "\n".join(f"line{i}" for i in range(80))
+            _append_line(
+                session,
+                _write_tool_line(
+                    "Write",
+                    {"file_path": "/repo/diff_pg_target.py", "content": tall_content},
+                    session_id="diffPGSESS01",
+                    cwd="/home/dev/diffpgproj",
+                ),
+            )
+            await _pump(pilot, "/repo/diff_pg_target.py")
+            await _pump_diff(pilot, "diff_pg_target.py", clock=clock)
+
+            diff = pilot.app.query_one(DiffPanel)
+            diff.focus()
+            await pilot.pause()
+
+            # Unpinned: PageDown must not change _pin_scroll.
+            pin_scroll_before = app._diff_queue._pin_scroll
+            await pilot.press("pagedown")
+            await pilot.pause()
+            assert app._diff_queue._pin_scroll == pin_scroll_before, (
+                f"pagedown on UNPINNED diff must not change _pin_scroll; "
+                f"before={pin_scroll_before}, after={app._diff_queue._pin_scroll}"
+            )
+
+    async def test_diff_pagedown_pages_when_pinned(self, tmp_path: Path):
+        """PageDown on pinned Diff panel advances _pin_scroll by more than 1."""
+        root = tmp_path / "projects"
+        session = root / "proj" / "diff_pg_pin.jsonl"
+        clock = _ManualClock()
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg, now=clock)
+        async with app.run_test(size=(120, 40)) as pilot:
+            tall_content = "\n".join(f"line{i}" for i in range(80))
+            _append_line(
+                session,
+                _write_tool_line(
+                    "Write",
+                    {"file_path": "/repo/diff_pin_pg.py", "content": tall_content},
+                    session_id="diffPinPGSS01",
+                    cwd="/home/dev/diffpinproj",
+                ),
+            )
+            await _pump(pilot, "/repo/diff_pin_pg.py")
+            await _pump_diff(pilot, "diff_pin_pg.py", clock=clock)
+
+            diff = pilot.app.query_one(DiffPanel)
+            diff.focus()
+
+            # Pin via keyboard shortcut.
+            await pilot.press("p")
+            await pilot.pause()
+            assert (
+                "📌 pinned" in diff.rendered_text()
+            ), "Must be pinned before testing page scroll"
+
+            # Capture pin_scroll after a single ↓ step for comparison.
+            pin_before_down = app._diff_queue._pin_scroll
+            await pilot.press("down")
+            await pilot.pause()
+            single_step = app._diff_queue._pin_scroll - pin_before_down
+            assert single_step == 1, f"Expected single ↓ step=1, got {single_step}"
+
+            # Reset and measure PageDown jump.
+            app._diff_queue._pin_scroll = 0
+            await pilot.press("pagedown")
+            await pilot.pause()
+            page_jump = app._diff_queue._pin_scroll
+            assert page_jump > 1, (
+                f"pagedown on PINNED diff must advance _pin_scroll by more than 1; "
+                f"got {page_jump}"
+            )
+
+
 class TestTitleHighlightIntegration:
     """Integration: on_focus/on_blur re-render causes title highlight to follow focus."""
 

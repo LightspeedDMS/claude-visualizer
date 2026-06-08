@@ -99,6 +99,11 @@ DIFF_CHROME_ROWS = 4
 # first tick still computes a sensible scroll window (AC6).
 DIFF_DEFAULT_VIEWPORT = 20
 
+# Rows reserved for the panel title chrome (title line + blank spacer) when
+# computing the page-scroll step size.  Subtracting this from the panel's
+# content height gives the approximate number of data rows visible at once.
+_PANEL_TITLE_CHROME = 2
+
 # --- Commands feed (story #4) ---------------------------------------------
 # Header line for the bottom Commands feed panel.
 COMMANDS_TITLE = "Commands — live cross-session Bash & MCP feed"
@@ -309,13 +314,23 @@ class MruFilesPanel(Static):
         """Translate a wheel-down into a scroll-down (show later rows)."""
         self._scroll_mru(1)
 
+    def _page_step(self) -> int:
+        """Rows per page-scroll: content height minus title chrome, floored at 1."""
+        return max(1, self.content_size.height - _PANEL_TITLE_CHROME)
+
     def on_key(self, event) -> None:
-        """↑/↓ scroll the MRU row window when this panel is focused."""
+        """↑/↓/PageUp/PageDown scroll the MRU row window when this panel is focused."""
         if event.key == "up":
             self._scroll_mru(-1)
             event.stop()
         elif event.key == "down":
             self._scroll_mru(1)
+            event.stop()
+        elif event.key == "pagedown":
+            self._scroll_mru(self._page_step())
+            event.stop()
+        elif event.key == "pageup":
+            self._scroll_mru(-self._page_step())
             event.stop()
 
     def on_mouse_down(self, event) -> None:
@@ -543,13 +558,23 @@ class DiffPanel(Static):
         """Translate a wheel-down into a DiffScrolled(+1) message."""
         self.post_message(self.DiffScrolled(1))
 
+    def _page_step(self) -> int:
+        """Rows per page-scroll: content height minus title chrome, floored at 1."""
+        return max(1, self.content_size.height - _PANEL_TITLE_CHROME)
+
     def on_key(self, event) -> None:
-        """↑/↓ post DiffScrolled messages (no-op when unpinned via model)."""
+        """↑/↓/PageUp/PageDown post DiffScrolled messages (no-op when unpinned via model)."""
         if event.key == "up":
             self.post_message(self.DiffScrolled(-1))
             event.stop()
         elif event.key == "down":
             self.post_message(self.DiffScrolled(1))
+            event.stop()
+        elif event.key == "pagedown":
+            self.post_message(self.DiffScrolled(self._page_step()))
+            event.stop()
+        elif event.key == "pageup":
+            self.post_message(self.DiffScrolled(-self._page_step()))
             event.stop()
 
     def render(self) -> Text:
@@ -762,13 +787,23 @@ class CommandsPanel(Static):
         """Translate a wheel-down into a scroll-down (reveal older rows)."""
         self._scroll_commands(1)
 
+    def _page_step(self) -> int:
+        """Rows per page-scroll: content height minus title chrome, floored at 1."""
+        return max(1, self.content_size.height - _PANEL_TITLE_CHROME)
+
     def on_key(self, event) -> None:
-        """↑/↓ scroll the Commands row window when this panel is focused."""
+        """↑/↓/PageUp/PageDown scroll the Commands row window when this panel is focused."""
         if event.key == "up":
             self._scroll_commands(-1)
             event.stop()
         elif event.key == "down":
             self._scroll_commands(1)
+            event.stop()
+        elif event.key == "pagedown":
+            self._scroll_commands(self._page_step())
+            event.stop()
+        elif event.key == "pageup":
+            self._scroll_commands(-self._page_step())
             event.stop()
 
     def render(self) -> Text:
