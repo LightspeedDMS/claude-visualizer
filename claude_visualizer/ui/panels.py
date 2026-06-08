@@ -161,7 +161,13 @@ def format_mru_row(entry: MruEntry, highlighted: bool = False) -> str:
     return line
 
 
-def render_mru(model: MruModel, scroll_offset: int = 0, width: int = 0) -> Text:
+def render_mru(
+    model: MruModel,
+    scroll_offset: int = 0,
+    width: int = 0,
+    *,
+    focused: bool = False,
+) -> Text:
     """Render the MRU model as a newest-first Rich block, newest at the top.
 
     Returns a waiting message (still inside the titled block) when the model
@@ -177,9 +183,14 @@ def render_mru(model: MruModel, scroll_offset: int = 0, width: int = 0) -> Text:
     ``width`` when > 0 pads each row with trailing spaces so the background
     colour fills the full panel width (diff-editor style), rather than ending
     at the last text character.
+
+    ``focused`` when True renders the title with ``bold reverse`` so the panel
+    title highlights to indicate keyboard focus (no border change, no layout
+    shift).
     """
     out = Text()
-    out.append(f"{MRU_TITLE}\n\n", style="bold")
+    title_style = "bold reverse" if focused else "bold"
+    out.append(f"{MRU_TITLE}\n\n", style=title_style)
     rows = model.rows()
     if not rows:
         out.append(MRU_EMPTY_TEXT)
@@ -224,7 +235,12 @@ class MruFilesPanel(Static):
     The rendered value is a Rich :class:`~rich.text.Text` (so the highlighted
     row is styled on screen); ``rendered_text`` exposes its plain string for
     substring assertions in tests.
+
+    ``can_focus = True`` so Tab/Shift+Tab cycle through the three panels.
+    ↑/↓ keys scroll the visible row window (``_scroll_mru``).
     """
+
+    can_focus = True
 
     class FileClicked(Message):
         """Posted when the user clicks a file row in the MRU list."""
@@ -253,7 +269,9 @@ class MruFilesPanel(Static):
             self._scroll_offset = min(self._scroll_offset, len(self._rows) - 1)
         else:
             self._scroll_offset = 0
-        self._renderable = render_mru(model, self._scroll_offset, width)
+        self._renderable = render_mru(
+            model, self._scroll_offset, width, focused=self.has_focus
+        )
         if self.is_mounted:
             self.refresh()
 
@@ -265,7 +283,20 @@ class MruFilesPanel(Static):
             0, min(self._scroll_offset + delta, len(self._rows) - 1)
         )
         self._renderable = render_mru(
-            self._last_model, self._scroll_offset, self._last_width
+            self._last_model,
+            self._scroll_offset,
+            self._last_width,
+            focused=self.has_focus,
+        )
+        if self.is_mounted:
+            self.refresh()
+
+    def watch_has_focus(self, has_focus: bool) -> None:
+        """Re-highlight the title when keyboard focus enters/leaves this panel."""
+        if self._last_model is None:
+            return
+        self._renderable = render_mru(
+            self._last_model, self._scroll_offset, self._last_width, focused=has_focus
         )
         if self.is_mounted:
             self.refresh()
@@ -278,8 +309,20 @@ class MruFilesPanel(Static):
         """Translate a wheel-down into a scroll-down (show later rows)."""
         self._scroll_mru(1)
 
+    def on_key(self, event) -> None:
+        """↑/↓ scroll the MRU row window when this panel is focused."""
+        if event.key == "up":
+            self._scroll_mru(-1)
+            event.stop()
+        elif event.key == "down":
+            self._scroll_mru(1)
+            event.stop()
+
     def on_mouse_down(self, event) -> None:
         """Map mouse-down Y → MRU row, accounting for wrapped long rows.
+
+        Focuses the panel first so click-to-focus works, then maps the
+        click to the appropriate MRU row.
 
         Uses on_mouse_down instead of on_click because under tmux the button
         release event is not forwarded (tmux's root MouseDown1Pane binding
@@ -293,6 +336,7 @@ class MruFilesPanel(Static):
         Iterates only the VISIBLE rows (offset by _scroll_offset) so a click
         maps to the correct entry when the list has been scrolled.
         """
+        self.focus()
         _HEADER_LINES = 2  # title + blank line from render_mru()
         if event.offset.y < _HEADER_LINES or not self._rows:
             return
@@ -407,18 +451,27 @@ def render_diff_body(state: DisplayState) -> Text:
     return body
 
 
-def render_diff(state: Optional[DisplayState]) -> Text:
+def render_diff(
+    state: Optional[DisplayState],
+    *,
+    focused: bool = False,
+) -> Text:
     """Render the whole Diff panel: title + header + coloured body.
 
     A ``None`` state (nothing ever shown) or an empty state (no file_path /
     segments) renders the titled waiting message — the panel never blanks
     (AC7-adjacent).  Otherwise the header (model · 🧠 · filename · origin) sits
     above the colour-mapped diff body with its ``+N more`` badge.
+
+    ``focused`` when True renders the title with ``bold reverse`` so the panel
+    title highlights to indicate keyboard focus (no border change, no layout
+    shift).
     """
     out = Text()
     pinned = state is not None and getattr(state, "is_pinned", False)
     title = "Live Diff — 📌 pinned" if pinned else DIFF_TITLE
-    out.append(f"{title}\n", style="bold")
+    title_style = "bold reverse" if focused else "bold"
+    out.append(f"{title}\n", style=title_style)
     if state is None or state.file_path is None:
         out.append(f"\n{DIFF_EMPTY_TEXT}")
         return out
@@ -438,11 +491,15 @@ class DiffPanel(Static):
     rendered value is a Rich :class:`~rich.text.Text` so colours show on screen;
     ``rendered_text`` exposes its plain string for substring assertions.
 
+    ``can_focus = True`` so Tab/Shift+Tab cycle through the three panels.
+    ↑/↓ keys post :class:`DiffScrolled` messages (no-op when unpinned).
     When the diff is pinned, mouse-wheel events post a :class:`DiffScrolled`
     message that the app handles by calling ``DiffQueueModel.scroll_pin_by()``.
     Non-pinned diffs auto-scroll via the queue's dwell logic; the message is
     posted unconditionally and the app/model decide whether to act on it.
     """
+
+    can_focus = True
 
     class DiffScrolled(Message):
         """Posted when the user scrolls the diff panel with the mouse wheel.
@@ -460,12 +517,23 @@ class DiffPanel(Static):
     def __init__(self, **kwargs) -> None:
         super().__init__(DIFF_EMPTY_TEXT, **kwargs)
         self._renderable: Text = render_diff(None)
+        self._last_state: Optional[DisplayState] = None
 
     def update_from_state(self, state: Optional[DisplayState]) -> None:
         """Re-render the panel from the supplied display state (or None)."""
-        self._renderable = render_diff(state)
+        self._last_state = state
+        self._renderable = render_diff(state, focused=self.has_focus)
         if self.is_mounted:
             self.refresh()
+
+    def watch_has_focus(self, has_focus: bool) -> None:
+        self._renderable = render_diff(self._last_state, focused=has_focus)
+        if self.is_mounted:
+            self.refresh()
+
+    def on_mouse_down(self, event) -> None:
+        """Focus this panel on mouse-down so click-to-focus works."""
+        self.focus()
 
     def on_mouse_scroll_up(self, event) -> None:
         """Translate a wheel-up into a DiffScrolled(-1) message."""
@@ -474,6 +542,15 @@ class DiffPanel(Static):
     def on_mouse_scroll_down(self, event) -> None:
         """Translate a wheel-down into a DiffScrolled(+1) message."""
         self.post_message(self.DiffScrolled(1))
+
+    def on_key(self, event) -> None:
+        """↑/↓ post DiffScrolled messages (no-op when unpinned via model)."""
+        if event.key == "up":
+            self.post_message(self.DiffScrolled(-1))
+            event.stop()
+        elif event.key == "down":
+            self.post_message(self.DiffScrolled(1))
+            event.stop()
 
     def render(self) -> Text:
         """Return the current Rich renderable (Textual repaints from this)."""
@@ -553,23 +630,44 @@ def format_command_row(entry: CommandFeedEntry, width: int) -> str:
     return truncate_command(f"{time_prefix}{command}{origin_suffix}", width)
 
 
-def render_commands(model: CommandFeedModel, width: int) -> Text:
+def render_commands(
+    model: CommandFeedModel,
+    scroll_offset: int,
+    width: int,
+    *,
+    focused: bool = False,
+) -> Text:
     """Render the command feed newest-on-top as a Rich block (AC1/AC2).
 
+    ``scroll_offset`` skips the first N rows (rows are newest-first, so offset 0
+    shows the newest at top; a positive offset reveals older commands).  Keeping
+    offset at 0 and updating on every new record gives the autoscroll-follow
+    behaviour; a non-zero offset lets the user "hold" a position in history.
+
     Returns a waiting message (still inside the titled block) when the feed is
-    empty, so the panel never shows a blank void before any command is observed.
-    Each entry is rendered by :func:`format_command_row` truncated to ``width``;
-    the feed is a LOG so identical commands each get their own row (no dedup).
+    empty or the offset has scrolled past all rows, so the panel never shows a
+    blank void before any command is observed.  Each entry is rendered by
+    :func:`format_command_row` truncated to ``width``; the feed is a LOG so
+    identical commands each get their own row (no dedup).
+
+    ``focused`` when True renders the title with ``bold reverse`` so the panel
+    title highlights to indicate keyboard focus (no border change, no layout
+    shift).
     """
     out = Text()
-    out.append(f"{COMMANDS_TITLE}\n\n", style="bold")
+    title_style = "bold reverse" if focused else "bold"
+    out.append(f"{COMMANDS_TITLE}\n\n", style=title_style)
     rows = model.rows()
     if not rows:
         out.append(COMMANDS_EMPTY_TEXT)
         return out
-    for index, entry in enumerate(rows):
+    visible = rows[scroll_offset:]
+    if not visible:
+        out.append(COMMANDS_EMPTY_TEXT)
+        return out
+    for index, entry in enumerate(visible):
         out.append(format_command_row(entry, width))
-        if index < len(rows) - 1:
+        if index < len(visible) - 1:
             out.append("\n")
     return out
 
@@ -583,17 +681,95 @@ class CommandsPanel(Static):
     and only feeds the model.  The rendered value is a Rich
     :class:`~rich.text.Text`; ``rendered_text`` exposes its plain string for
     substring assertions in tests.
+
+    ``can_focus = True`` so Tab/Shift+Tab cycle through the three panels.
+    ↑/↓ keys scroll the visible row window; the panel follows the newest command
+    automatically (``_follow = True``) until the user scrolls away.
     """
+
+    can_focus = True
 
     def __init__(self, **kwargs) -> None:
         super().__init__(COMMANDS_EMPTY_TEXT, **kwargs)
         self._renderable: Text = Text(COMMANDS_EMPTY_TEXT)
+        self._scroll_offset: int = 0
+        self._follow: bool = True
+        self._last_model: Optional[CommandFeedModel] = None
+        self._last_width: int = 0
 
     def update_from_model(self, model: CommandFeedModel, width: int) -> None:
-        """Re-render the panel from the model's current rows at ``width``."""
-        self._renderable = render_commands(model, width)
+        """Re-render the panel from the model's current rows at ``width``.
+
+        When ``_follow`` is True the scroll offset is reset to 0 so the newest
+        command stays visible (autoscroll-follow).  When ``_follow`` is False
+        (user has manually scrolled) the offset is preserved and only clamped so
+        it cannot exceed the last valid row index.
+        """
+        self._last_model = model
+        self._last_width = width
+        rows = model.rows()
+        if self._follow:
+            self._scroll_offset = 0
+        else:
+            self._scroll_offset = min(self._scroll_offset, max(0, len(rows) - 1))
+        self._renderable = render_commands(
+            model, self._scroll_offset, width, focused=self.has_focus
+        )
         if self.is_mounted:
             self.refresh()
+
+    def _scroll_commands(self, delta: int) -> None:
+        """Adjust ``_scroll_offset`` by ``delta`` and repaint from stored model.
+
+        Clamped so the offset is always in [0, len(rows)-1].  When the offset
+        returns to 0 ``_follow`` is re-enabled so the next new command snaps
+        back to the top (autoscroll-follow resumes).
+        """
+        if self._last_model is None:
+            return
+        rows = self._last_model.rows()
+        self._scroll_offset = max(
+            0, min(self._scroll_offset + delta, max(0, len(rows) - 1))
+        )
+        self._follow = self._scroll_offset == 0
+        self._renderable = render_commands(
+            self._last_model,
+            self._scroll_offset,
+            self._last_width,
+            focused=self.has_focus,
+        )
+        if self.is_mounted:
+            self.refresh()
+
+    def watch_has_focus(self, has_focus: bool) -> None:
+        if self._last_model is None:
+            return
+        self._renderable = render_commands(
+            self._last_model, self._scroll_offset, self._last_width, focused=has_focus
+        )
+        if self.is_mounted:
+            self.refresh()
+
+    def on_mouse_down(self, event) -> None:
+        """Focus this panel on mouse-down so click-to-focus works."""
+        self.focus()
+
+    def on_mouse_scroll_up(self, event) -> None:
+        """Translate a wheel-up into a scroll-up (reveal newer / top rows)."""
+        self._scroll_commands(-1)
+
+    def on_mouse_scroll_down(self, event) -> None:
+        """Translate a wheel-down into a scroll-down (reveal older rows)."""
+        self._scroll_commands(1)
+
+    def on_key(self, event) -> None:
+        """↑/↓ scroll the Commands row window when this panel is focused."""
+        if event.key == "up":
+            self._scroll_commands(-1)
+            event.stop()
+        elif event.key == "down":
+            self._scroll_commands(1)
+            event.stop()
 
     def render(self) -> Text:
         """Return the current Rich renderable (Textual repaints from this)."""

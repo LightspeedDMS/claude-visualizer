@@ -106,8 +106,8 @@ class VisualizerApp(App):
     }
     #bottom {
         height: 8;
-        padding: 0 1;
         color: $text-muted;
+        padding: 0 1;
     }
     """
 
@@ -151,6 +151,12 @@ class VisualizerApp(App):
         # grow/shrink actions would compute 38+2=40 — a no-op.  Tracking the
         # outer value sidesteps that padding-offset mismatch entirely.
         self._mru_width = 40
+        # Outer-box CSS height for the bottom Commands panel.  size.height
+        # under layout constraints may not reflect the CSS-requested value
+        # (the panel can be squeezed below its requested height), so tracking
+        # the desired CSS outer height here is the only reliable way to
+        # implement grow/shrink — same pattern as _mru_width above.
+        self._bottom_height = 8
         self._monitor_registry = MonitorRegistry(config)
         self._monitors_timer: Optional[Timer] = None
 
@@ -331,17 +337,17 @@ class VisualizerApp(App):
             return
 
     def on_key(self, event) -> None:
-        """Handle arrow keys for splitter resize before any child can consume them."""
-        if event.key == "left":
+        """Handle Shift+Arrow for splitter resize; plain arrows fall through to focused panel."""
+        if event.key == "shift+left":
             self.action_shrink_mru()
             event.stop()
-        elif event.key == "right":
+        elif event.key == "shift+right":
             self.action_grow_mru()
             event.stop()
-        elif event.key == "up":
+        elif event.key == "shift+up":
             self.action_grow_bottom()
             event.stop()
-        elif event.key == "down":
+        elif event.key == "shift+down":
             self.action_shrink_bottom()
             event.stop()
 
@@ -359,15 +365,15 @@ class VisualizerApp(App):
 
     def action_grow_bottom(self) -> None:
         """Move horizontal splitter up: bottom Commands panel gains 1 row."""
-        bottom = self.query_one("#bottom")
-        bottom.styles.height = bottom.size.height + _SPLITTER_STEP_V
+        self._bottom_height += _SPLITTER_STEP_V
+        self.query_one("#bottom").styles.height = self._bottom_height
 
     def action_shrink_bottom(self) -> None:
         """Move horizontal splitter down: bottom Commands panel loses 1 row."""
-        bottom = self.query_one("#bottom")
-        bottom.styles.height = max(
-            _BOTTOM_MIN_HEIGHT, bottom.size.height - _SPLITTER_STEP_V
+        self._bottom_height = max(
+            _BOTTOM_MIN_HEIGHT, self._bottom_height - _SPLITTER_STEP_V
         )
+        self.query_one("#bottom").styles.height = self._bottom_height
 
     def action_pin_current(self) -> None:
         """Pin the diff currently displayed in the Diff panel (keyboard shortcut `p`).

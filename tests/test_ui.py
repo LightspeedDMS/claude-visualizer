@@ -42,6 +42,7 @@ from claude_visualizer.ui.panels import (
     format_command_row,
     format_mru_row,
     render_commands,
+    render_diff,
     render_monitor_bar,
     render_mru,
     truncate_command,
@@ -571,27 +572,27 @@ class TestFormatCommandRow:
 class TestRenderCommands:
     def test_empty_model_renders_placeholder(self):
         model = CommandFeedModel(AppConfig(command_feed_max=10))
-        text = render_commands(model, width=80).plain
+        text = render_commands(model, 0, width=80).plain
         assert COMMANDS_EMPTY_TEXT in text
 
     def test_commands_rendered_newest_on_top(self):
         model = CommandFeedModel(AppConfig(command_feed_max=10))
         model.record(_cmd_event(command="older-cmd"))
         model.record(_cmd_event(command="newer-cmd"))
-        text = render_commands(model, width=80).plain
+        text = render_commands(model, 0, width=80).plain
         assert text.index("newer-cmd") < text.index("older-cmd")
 
     def test_no_dedup_both_identical_rows_rendered(self):
         model = CommandFeedModel(AppConfig(command_feed_max=10))
         model.record(_cmd_event(command="dup-cmd"))
         model.record(_cmd_event(command="dup-cmd"))
-        text = render_commands(model, width=80).plain
+        text = render_commands(model, 0, width=80).plain
         assert text.count("dup-cmd") == 2
 
     def test_subagent_marker_present_for_subagent_row(self):
         model = CommandFeedModel(AppConfig(command_feed_max=10))
         model.record(_cmd_event(command="sub-cmd", is_subagent=True))
-        assert SUBAGENT_MARKER in render_commands(model, width=80).plain
+        assert SUBAGENT_MARKER in render_commands(model, 0, width=80).plain
 
 
 class TestCommandsPanelWidget:
@@ -1963,6 +1964,87 @@ class TestFixtureConfigMonitorsDir:
 # ---------------------------------------------------------------------------
 
 
+class TestShiftArrowSplitters:
+    """Shift+Arrow resizes splitters; plain arrows fall through (Feature 1)."""
+
+    async def test_shift_right_grows_mru_width(self, tmp_path: Path):
+        cfg = _fixture_config(tmp_path / "projects")
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            before = app._mru_width
+            await pilot.press("shift+right")
+            await pilot.pause()
+            assert (
+                app._mru_width > before
+            ), f"shift+right must grow _mru_width; before={before}, after={app._mru_width}"
+
+    async def test_shift_left_shrinks_mru_width(self, tmp_path: Path):
+        cfg = _fixture_config(tmp_path / "projects")
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            before = app._mru_width
+            await pilot.press("shift+left")
+            await pilot.pause()
+            assert (
+                app._mru_width < before
+            ), f"shift+left must shrink _mru_width; before={before}, after={app._mru_width}"
+
+    async def test_shift_up_grows_bottom_height(self, tmp_path: Path):
+        cfg = _fixture_config(tmp_path / "projects")
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            before = app.query_one("#bottom").size.height
+            await pilot.press("shift+up")
+            await pilot.pause()
+            after = app.query_one("#bottom").size.height
+            assert (
+                after > before
+            ), f"shift+up must grow bottom height; before={before}, after={after}"
+
+    async def test_shift_down_shrinks_bottom_height(self, tmp_path: Path):
+        cfg = _fixture_config(tmp_path / "projects")
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            # First grow so we can shrink
+            await pilot.press("shift+up")
+            await pilot.pause()
+            before = app.query_one("#bottom").size.height
+            await pilot.press("shift+down")
+            await pilot.pause()
+            after = app.query_one("#bottom").size.height
+            assert (
+                after < before
+            ), f"shift+down must shrink bottom height; before={before}, after={after}"
+
+    async def test_plain_right_does_not_resize_splitter(self, tmp_path: Path):
+        cfg = _fixture_config(tmp_path / "projects")
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            before = app._mru_width
+            await pilot.press("right")
+            await pilot.pause()
+            assert (
+                app._mru_width == before
+            ), f"plain right must NOT resize splitter; before={before}, after={app._mru_width}"
+
+    async def test_plain_up_does_not_resize_splitter(self, tmp_path: Path):
+        cfg = _fixture_config(tmp_path / "projects")
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            before = app.query_one("#bottom").size.height
+            await pilot.press("up")
+            await pilot.pause()
+            after = app.query_one("#bottom").size.height
+            assert (
+                after == before
+            ), f"plain up must NOT resize splitter; before={before}, after={after}"
+
+
 class TestNetworkGuard:
     """Prove the conftest network guard works correctly.
 
@@ -2005,3 +2087,653 @@ class TestNetworkGuard:
         # Non-tuple inputs — must return False safely (no crash).
         assert _is_loopback("/tmp/sock") is False  # AF_UNIX path string
         assert _is_loopback(None) is False
+
+
+# ---------------------------------------------------------------------------
+# Feature 2 — Focusable panels (can_focus, Tab cycle, click-to-focus, ↑/↓)
+# ---------------------------------------------------------------------------
+
+
+class TestFocusablePanels:
+    """Panels are focusable: Tab cycles them, click focuses, ↑/↓ scroll."""
+
+    def test_mru_panel_can_focus(self):
+        """MruFilesPanel must declare can_focus = True."""
+        assert MruFilesPanel.can_focus is True
+
+    def test_diff_panel_can_focus(self):
+        """DiffPanel must declare can_focus = True."""
+        assert DiffPanel.can_focus is True
+
+    def test_commands_panel_can_focus(self):
+        """CommandsPanel must declare can_focus = True."""
+        assert CommandsPanel.can_focus is True
+
+    async def test_tab_cycles_focus_mru_to_diff_to_commands(self, tmp_path: Path):
+        """Tab moves focus MRU → Diff → Commands in order."""
+        cfg = _fixture_config(tmp_path / "projects")
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            # Focus the MRU panel first.
+            mru = pilot.app.query_one(MruFilesPanel)
+            mru.focus()
+            await pilot.pause()
+            assert (
+                pilot.app.focused is mru
+            ), "MRU must be focused after explicit focus()"
+
+            # Tab → Diff panel.
+            await pilot.press("tab")
+            await pilot.pause()
+            diff = pilot.app.query_one(DiffPanel)
+            assert pilot.app.focused is diff, (
+                f"After tab from MRU, expected DiffPanel focused; "
+                f"got {type(pilot.app.focused).__name__}"
+            )
+
+            # Tab → Commands panel.
+            await pilot.press("tab")
+            await pilot.pause()
+            commands = pilot.app.query_one(CommandsPanel)
+            assert pilot.app.focused is commands, (
+                f"After tab from Diff, expected CommandsPanel focused; "
+                f"got {type(pilot.app.focused).__name__}"
+            )
+
+    async def test_shift_tab_reverses_focus_cycle(self, tmp_path: Path):
+        """Shift+Tab reverses the Tab focus cycle."""
+        cfg = _fixture_config(tmp_path / "projects")
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            commands = pilot.app.query_one(CommandsPanel)
+            commands.focus()
+            await pilot.pause()
+            assert pilot.app.focused is commands
+
+            # Shift+Tab → Diff.
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            diff = pilot.app.query_one(DiffPanel)
+            assert pilot.app.focused is diff, (
+                f"After shift+tab from Commands, expected DiffPanel focused; "
+                f"got {type(pilot.app.focused).__name__}"
+            )
+
+    async def test_mouse_down_focuses_diff_panel(self, tmp_path: Path):
+        """Clicking the Diff panel focuses it."""
+        cfg = _fixture_config(tmp_path / "projects")
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            diff = pilot.app.query_one(DiffPanel)
+            await pilot.mouse_down(diff, offset=(5, 2))
+            await pilot.pause()
+            assert pilot.app.focused is diff, (
+                f"mouse_down on DiffPanel must focus it; "
+                f"got {type(pilot.app.focused).__name__}"
+            )
+
+    async def test_mouse_down_focuses_commands_panel(self, tmp_path: Path):
+        """Clicking the Commands panel focuses it."""
+        cfg = _fixture_config(tmp_path / "projects")
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            cmd_panel = pilot.app.query_one(CommandsPanel)
+            await pilot.mouse_down(cmd_panel, offset=(5, 2))
+            await pilot.pause()
+            assert pilot.app.focused is cmd_panel, (
+                f"mouse_down on CommandsPanel must focus it; "
+                f"got {type(pilot.app.focused).__name__}"
+            )
+
+    async def test_focus_border_no_layout_shift(self, tmp_path: Path):
+        """content_size must be identical focused vs unfocused (no layout shift)."""
+        cfg = _fixture_config(tmp_path / "projects")
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            mru = pilot.app.query_one(MruFilesPanel)
+            diff = pilot.app.query_one(DiffPanel)
+            # Measure content_size while MRU is NOT focused.
+            diff.focus()
+            await pilot.pause()
+            await pilot.pause()
+            unfocused_size = mru.content_size
+            # Now focus MRU.
+            mru.focus()
+            await pilot.pause()
+            await pilot.pause()
+            focused_size = mru.content_size
+            assert focused_size == unfocused_size, (
+                f"content_size must not change on focus: "
+                f"unfocused={unfocused_size}, focused={focused_size}"
+            )
+
+    async def test_mru_down_key_increases_scroll_offset(self, tmp_path: Path):
+        """↓ on focused MRU panel increases _scroll_offset."""
+        root = tmp_path / "projects"
+        session = root / "proj" / "mru_scroll.jsonl"
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            # Seed several MRU entries so there is something to scroll.
+            for i in range(8):
+                _append_line(
+                    session,
+                    _write_tool_line(
+                        "Write",
+                        {"file_path": f"/repo/file_{i:02d}.py", "content": "x"},
+                        session_id=f"mruSESS{i:04d}",
+                        cwd="/home/dev/mruproj",
+                    ),
+                )
+            await _pump(pilot, "/repo/file_07.py")
+
+            mru = pilot.app.query_one(MruFilesPanel)
+            mru.focus()
+            await pilot.pause()
+            before = mru._scroll_offset
+            await pilot.press("down")
+            await pilot.pause()
+            assert mru._scroll_offset > before, (
+                f"↓ on focused MRU must increase _scroll_offset; "
+                f"before={before}, after={mru._scroll_offset}"
+            )
+
+    async def test_mru_up_key_decreases_scroll_offset_floor_zero(self, tmp_path: Path):
+        """↑ on focused MRU panel decreases _scroll_offset, floored at 0."""
+        root = tmp_path / "projects"
+        session = root / "proj" / "mru_up.jsonl"
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            for i in range(6):
+                _append_line(
+                    session,
+                    _write_tool_line(
+                        "Write",
+                        {"file_path": f"/repo/up_{i:02d}.py", "content": "x"},
+                        session_id=f"upSESS{i:04d}",
+                        cwd="/home/dev/uproj",
+                    ),
+                )
+            await _pump(pilot, "/repo/up_05.py")
+
+            mru = pilot.app.query_one(MruFilesPanel)
+            mru.focus()
+            # Scroll down first so there is room to scroll up.
+            await pilot.press("down")
+            await pilot.press("down")
+            await pilot.pause()
+            assert mru._scroll_offset >= 2
+
+            # Now scroll up — offset should decrease.
+            await pilot.press("up")
+            await pilot.pause()
+            assert mru._scroll_offset < 2, (
+                f"↑ on focused MRU must decrease _scroll_offset; "
+                f"after two down + one up, got {mru._scroll_offset}"
+            )
+
+            # At offset 0, ↑ does not go negative.
+            mru._scroll_offset = 0
+            await pilot.press("up")
+            await pilot.pause()
+            assert mru._scroll_offset == 0, "↑ at offset 0 must stay at 0"
+
+    async def test_diff_down_key_only_scrolls_when_pinned(self, tmp_path: Path):
+        """↓ on focused Diff panel does nothing when unpinned; scrolls when pinned."""
+        root = tmp_path / "projects"
+        session = root / "proj" / "diff_key.jsonl"
+        clock = _ManualClock()
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg, now=clock)
+        async with app.run_test(size=(120, 40)) as pilot:
+            tall_content = "\n".join(f"line{i}" for i in range(80))
+            _append_line(
+                session,
+                _write_tool_line(
+                    "Write",
+                    {"file_path": "/repo/diff_key_target.py", "content": tall_content},
+                    session_id="diffKeySESS01",
+                    cwd="/home/dev/diffkeyproj",
+                ),
+            )
+            await _pump(pilot, "/repo/diff_key_target.py")
+            await _pump_diff(pilot, "diff_key_target.py", clock=clock)
+
+            diff = pilot.app.query_one(DiffPanel)
+            diff.focus()
+            await pilot.pause()
+
+            # Unpinned: ↓ should not change pin_scroll (scroll_pin_by is no-op
+            # when unpinned).
+            pin_scroll_before = app._diff_queue._pin_scroll
+            await pilot.press("down")
+            await pilot.pause()
+            assert app._diff_queue._pin_scroll == pin_scroll_before, (
+                f"↓ on UNPINNED diff must not change _pin_scroll; "
+                f"before={pin_scroll_before}, after={app._diff_queue._pin_scroll}"
+            )
+
+            # Pin the diff and verify ↓ advances scroll.
+            await pilot.press("p")
+            await pilot.pause()
+            assert "📌 pinned" in diff.rendered_text()
+
+            pin_scroll_before = app._diff_queue._pin_scroll
+            await pilot.press("down")
+            await pilot.pause()
+            assert app._diff_queue._pin_scroll > pin_scroll_before, (
+                f"↓ on PINNED diff must advance _pin_scroll; "
+                f"before={pin_scroll_before}, after={app._diff_queue._pin_scroll}"
+            )
+
+    async def test_diff_up_key_when_pinned_decreases_scroll(self, tmp_path: Path):
+        """↑ on focused pinned Diff panel decreases _pin_scroll, floor 0."""
+        root = tmp_path / "projects"
+        session = root / "proj" / "diff_up.jsonl"
+        clock = _ManualClock()
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg, now=clock)
+        async with app.run_test(size=(120, 40)) as pilot:
+            tall_content = "\n".join(f"line{i}" for i in range(80))
+            _append_line(
+                session,
+                _write_tool_line(
+                    "Write",
+                    {"file_path": "/repo/diff_up_target.py", "content": tall_content},
+                    session_id="diffUpSESS01",
+                    cwd="/home/dev/diffupproj",
+                ),
+            )
+            await _pump(pilot, "/repo/diff_up_target.py")
+            await _pump_diff(pilot, "diff_up_target.py", clock=clock)
+
+            diff = pilot.app.query_one(DiffPanel)
+            diff.focus()
+
+            # Pin and scroll down first.
+            await pilot.press("p")
+            await pilot.pause()
+            assert "📌 pinned" in diff.rendered_text()
+
+            await pilot.press("down")
+            await pilot.press("down")
+            await pilot.pause()
+            assert app._diff_queue._pin_scroll >= 2
+
+            # ↑ on pinned diff decreases _pin_scroll.
+            pin_scroll_before = app._diff_queue._pin_scroll
+            await pilot.press("up")
+            await pilot.pause()
+            assert app._diff_queue._pin_scroll < pin_scroll_before, (
+                f"↑ on PINNED diff must decrease _pin_scroll; "
+                f"before={pin_scroll_before}, after={app._diff_queue._pin_scroll}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Feature 3 — Commands panel scroll + follow + autoscroll-follow
+# ---------------------------------------------------------------------------
+
+
+class TestCommandsScroll:
+    """Commands panel scroll, follow flag, wheel, and autoscroll-follow."""
+
+    def _populate_commands(self, n: int, root: Path) -> Path:
+        """Write n Bash JSONL lines to a temp session; return the session path."""
+        session = root / "proj" / "cmd_scroll.jsonl"
+        for i in range(n):
+            _append_line(
+                session,
+                _write_tool_line(
+                    "Bash",
+                    {"command": f"cmd-scroll-{i:02d}"},
+                    session_id=f"cmdSCROLL{i:04d}",
+                    cwd="/home/dev/scrollcmd",
+                ),
+            )
+        return session
+
+    def test_render_commands_with_scroll_offset_zero_shows_newest(self):
+        """render_commands(model, scroll_offset=0, width) shows newest at top."""
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        model.record(_cmd_event(command="older-cmd"))
+        model.record(_cmd_event(command="newer-cmd"))
+        text = render_commands(model, 0, 80).plain
+        assert text.index("newer-cmd") < text.index("older-cmd")
+
+    def test_render_commands_with_scroll_offset_hides_newest(self):
+        """render_commands(model, scroll_offset=1, width) skips the newest row."""
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        model.record(_cmd_event(command="oldest-cmd"))
+        model.record(_cmd_event(command="middle-cmd"))
+        model.record(_cmd_event(command="newest-cmd"))
+        # offset=1 → skip newest-cmd (rows()[0]) → start from middle-cmd.
+        text = render_commands(model, 1, 80).plain
+        assert "newest-cmd" not in text
+        assert "middle-cmd" in text
+        assert "oldest-cmd" in text
+
+    def test_commands_panel_initial_scroll_offset_zero(self):
+        """CommandsPanel starts with _scroll_offset=0 and _follow=True."""
+        panel = CommandsPanel()
+        assert panel._scroll_offset == 0
+        assert panel._follow is True
+
+    def test_commands_panel_follow_true_keeps_offset_zero_on_new_record(self):
+        """When _follow=True, a new record via update_from_model keeps offset=0."""
+        panel = CommandsPanel()
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        for i in range(5):
+            model.record(_cmd_event(command=f"cmd-{i}"))
+        panel.update_from_model(model, 80)
+        assert panel._scroll_offset == 0
+        # Add one more and update — offset stays 0 (follow=True).
+        model.record(_cmd_event(command="cmd-5"))
+        panel.update_from_model(model, 80)
+        assert (
+            panel._scroll_offset == 0
+        ), "_follow=True must keep offset at 0 on new record"
+
+    def test_commands_panel_scroll_down_increases_offset_and_disables_follow(self):
+        """_scroll_commands(+1) increases offset and sets _follow=False."""
+        panel = CommandsPanel()
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        for i in range(5):
+            model.record(_cmd_event(command=f"cmd-{i}"))
+        panel.update_from_model(model, 80)
+        assert panel._scroll_offset == 0
+        panel._scroll_commands(1)
+        assert panel._scroll_offset == 1
+        assert panel._follow is False
+
+    def test_commands_panel_scroll_back_to_zero_reenables_follow(self):
+        """Scrolling back to offset 0 re-enables _follow."""
+        panel = CommandsPanel()
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        for i in range(5):
+            model.record(_cmd_event(command=f"cmd-{i}"))
+        panel.update_from_model(model, 80)
+        panel._scroll_commands(1)
+        assert panel._follow is False
+        panel._scroll_commands(-1)
+        assert panel._scroll_offset == 0
+        assert panel._follow is True
+
+    def test_commands_panel_follow_false_keeps_offset_on_new_record(self):
+        """When _follow=False, a new record does NOT reset offset to 0."""
+        panel = CommandsPanel()
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        for i in range(5):
+            model.record(_cmd_event(command=f"cmd-{i}"))
+        panel.update_from_model(model, 80)
+        panel._scroll_commands(2)
+        assert panel._scroll_offset == 2
+        assert panel._follow is False
+        # Add a new command and update — offset must stay at 2, not reset.
+        model.record(_cmd_event(command="cmd-5"))
+        panel.update_from_model(model, 80)
+        assert (
+            panel._scroll_offset == 2
+        ), "_follow=False must preserve offset when a new command arrives"
+
+    def test_commands_scroll_clamps_at_list_length_minus_one(self):
+        """_scroll_commands clamps offset to len(rows)-1."""
+        panel = CommandsPanel()
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        for i in range(3):
+            model.record(_cmd_event(command=f"cmd-{i}"))
+        panel.update_from_model(model, 80)
+        for _ in range(20):
+            panel._scroll_commands(1)
+        assert panel._scroll_offset <= 2  # max index = 3-1
+
+    def test_commands_wheel_up_calls_scroll_minus_one(self):
+        """on_mouse_scroll_up scrolls up (offset -1)."""
+        panel = CommandsPanel()
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        for i in range(5):
+            model.record(_cmd_event(command=f"cmd-{i}"))
+        panel.update_from_model(model, 80)
+        panel._scroll_commands(3)  # start at offset 3
+        panel.on_mouse_scroll_up(None)
+        assert panel._scroll_offset == 2
+
+    def test_commands_wheel_down_calls_scroll_plus_one(self):
+        """on_mouse_scroll_down scrolls down (offset +1)."""
+        panel = CommandsPanel()
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        for i in range(5):
+            model.record(_cmd_event(command=f"cmd-{i}"))
+        panel.update_from_model(model, 80)
+        panel.on_mouse_scroll_down(None)
+        assert panel._scroll_offset == 1
+
+    async def test_commands_down_key_increases_scroll_offset(self, tmp_path: Path):
+        """↓ on focused Commands panel increases _scroll_offset."""
+        root = tmp_path / "projects"
+        self._populate_commands(8, root)
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            text = await _pump_commands(pilot, "cmd-scroll-07")
+            assert "cmd-scroll-07" in text
+
+            cmd_panel = pilot.app.query_one(CommandsPanel)
+            cmd_panel.focus()
+            await pilot.pause()
+            before = cmd_panel._scroll_offset
+            await pilot.press("down")
+            await pilot.pause()
+            assert cmd_panel._scroll_offset > before, (
+                f"↓ on focused Commands must increase _scroll_offset; "
+                f"before={before}, after={cmd_panel._scroll_offset}"
+            )
+
+    async def test_commands_up_key_decreases_scroll_offset(self, tmp_path: Path):
+        """↑ on focused Commands panel decreases _scroll_offset, floor 0."""
+        root = tmp_path / "projects"
+        self._populate_commands(8, root)
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            text = await _pump_commands(pilot, "cmd-scroll-07")
+            assert "cmd-scroll-07" in text
+
+            cmd_panel = pilot.app.query_one(CommandsPanel)
+            cmd_panel.focus()
+            await pilot.pause()
+
+            # Scroll down first so there is room to scroll up.
+            await pilot.press("down")
+            await pilot.press("down")
+            await pilot.pause()
+            assert cmd_panel._scroll_offset >= 2
+
+            before = cmd_panel._scroll_offset
+            await pilot.press("up")
+            await pilot.pause()
+            assert cmd_panel._scroll_offset < before, (
+                f"↑ on focused Commands must decrease _scroll_offset; "
+                f"before={before}, after={cmd_panel._scroll_offset}"
+            )
+
+            # At offset 0, ↑ must not go negative.
+            cmd_panel._scroll_offset = 0
+            cmd_panel._follow = True
+            await pilot.press("up")
+            await pilot.pause()
+            assert cmd_panel._scroll_offset == 0, "↑ at offset 0 must stay at 0"
+
+    async def test_commands_scroll_follow_new_command_does_not_reset_when_unfollowed(
+        self, tmp_path: Path
+    ):
+        """When user has scrolled (follow=False), a new command preserves offset."""
+        root = tmp_path / "projects"
+        session = root / "proj" / "follow_test.jsonl"
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            for i in range(6):
+                _append_line(
+                    session,
+                    _write_tool_line(
+                        "Bash",
+                        {"command": f"follow-cmd-{i:02d}"},
+                        session_id=f"followSESS{i:04d}",
+                        cwd="/home/dev/followproj",
+                    ),
+                )
+            await _pump_commands(pilot, "follow-cmd-05")
+
+            cmd_panel = pilot.app.query_one(CommandsPanel)
+            cmd_panel.focus()
+            await pilot.pause()
+            # Scroll down — disables follow.
+            await pilot.press("down")
+            await pilot.pause()
+            assert cmd_panel._follow is False
+            scroll_pos = cmd_panel._scroll_offset
+            assert scroll_pos > 0
+
+            # Append a new command — follow=False means offset must NOT reset.
+            _append_line(
+                session,
+                _write_tool_line(
+                    "Bash",
+                    {"command": "follow-cmd-NEW"},
+                    session_id="followSESS9999",
+                    cwd="/home/dev/followproj",
+                ),
+            )
+            await _pump_commands(pilot, "follow-cmd-NEW")
+            # Offset must not have been reset to 0.
+            assert cmd_panel._scroll_offset == scroll_pos, (
+                f"follow=False must preserve scroll pos when new cmd arrives; "
+                f"expected {scroll_pos}, got {cmd_panel._scroll_offset}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Feature 4 — Title-highlight on focus (bold reverse on the focused panel title)
+# ---------------------------------------------------------------------------
+
+
+def _has_reverse_on_title(text, title: str) -> bool:
+    """Return True iff the Rich Text has a 'reverse' span that covers the title."""
+    pos = text.plain.find(title)
+    if pos < 0:
+        return False
+    return any(
+        "reverse" in str(s.style) and s.start <= pos and s.end >= pos + len(title)
+        for s in text.spans
+    )
+
+
+class TestTitleHighlightPure:
+    """Pure renderer tests: focused=True/False controls 'reverse' on panel titles."""
+
+    @pytest.mark.parametrize("focused,expect_reverse", [(True, True), (False, False)])
+    def test_render_mru_title_style(self, focused, expect_reverse):
+        """render_mru focused=True→reverse on title; False→no reverse."""
+        from claude_visualizer.ui.panels import MRU_TITLE
+
+        model = MruModel(AppConfig(mru_max=10))
+        text = render_mru(model, 0, 0, focused=focused)
+        result = _has_reverse_on_title(text, MRU_TITLE)
+        assert result == expect_reverse, (
+            f"render_mru(focused={focused}) reverse={result}, expected {expect_reverse}; "
+            f"spans: {text.spans}"
+        )
+
+    def test_render_mru_default_no_reverse(self):
+        """render_mru() without focused kwarg defaults to no reverse on title."""
+        from claude_visualizer.ui.panels import MRU_TITLE
+
+        text = render_mru(MruModel(AppConfig(mru_max=10)))
+        assert not _has_reverse_on_title(text, MRU_TITLE)
+
+    @pytest.mark.parametrize("focused,expect_reverse", [(True, True), (False, False)])
+    def test_render_diff_title_style(self, focused, expect_reverse):
+        """render_diff focused=True→reverse on title; False→no reverse."""
+        from claude_visualizer.ui.panels import DIFF_TITLE
+
+        text = render_diff(None, focused=focused)
+        result = _has_reverse_on_title(text, DIFF_TITLE)
+        assert result == expect_reverse, (
+            f"render_diff(focused={focused}) reverse={result}, expected {expect_reverse}; "
+            f"spans: {text.spans}"
+        )
+
+    def test_render_diff_default_no_reverse(self):
+        """render_diff() without focused kwarg defaults to no reverse on title."""
+        from claude_visualizer.ui.panels import DIFF_TITLE
+
+        text = render_diff(None)
+        assert not _has_reverse_on_title(text, DIFF_TITLE)
+
+    @pytest.mark.parametrize("focused,expect_reverse", [(True, True), (False, False)])
+    def test_render_commands_title_style(self, focused, expect_reverse):
+        """render_commands focused=True→reverse on title; False→no reverse."""
+        from claude_visualizer.ui.panels import COMMANDS_TITLE
+
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        text = render_commands(model, 0, 80, focused=focused)
+        result = _has_reverse_on_title(text, COMMANDS_TITLE)
+        assert result == expect_reverse, (
+            f"render_commands(focused={focused}) reverse={result}, expected {expect_reverse}; "
+            f"spans: {text.spans}"
+        )
+
+    def test_render_commands_default_no_reverse(self):
+        """render_commands() without focused kwarg defaults to no reverse on title."""
+        from claude_visualizer.ui.panels import COMMANDS_TITLE
+
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        text = render_commands(model, 0, 80)
+        assert not _has_reverse_on_title(text, COMMANDS_TITLE)
+
+
+class TestTitleHighlightIntegration:
+    """Integration: on_focus/on_blur re-render causes title highlight to follow focus."""
+
+    async def test_focus_mru_highlights_mru_title_only(self, tmp_path: Path):
+        """MRU title is 'reverse' when focused; Diff and Commands titles are plain."""
+        cfg = _fixture_config(tmp_path / "projects")
+        app = VisualizerApp(cfg)
+        from claude_visualizer.ui.panels import COMMANDS_TITLE, DIFF_TITLE, MRU_TITLE
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            pilot.app.query_one(MruFilesPanel).focus()
+            await pilot.pause()
+            await pilot.pause()
+
+            assert _has_reverse_on_title(
+                pilot.app.query_one(MruFilesPanel)._renderable, MRU_TITLE
+            ), "MRU title must be 'reverse' when focused"
+            assert not _has_reverse_on_title(
+                pilot.app.query_one(DiffPanel)._renderable, DIFF_TITLE
+            ), "Diff title must NOT be 'reverse' when MRU is focused"
+            assert not _has_reverse_on_title(
+                pilot.app.query_one(CommandsPanel)._renderable, COMMANDS_TITLE
+            ), "Commands title must NOT be 'reverse' when MRU is focused"
+
+    async def test_tab_moves_highlight_from_mru_to_diff(self, tmp_path: Path):
+        """After Tab from MRU → Diff, Diff title gets 'reverse' and MRU loses it."""
+        cfg = _fixture_config(tmp_path / "projects")
+        app = VisualizerApp(cfg)
+        from claude_visualizer.ui.panels import DIFF_TITLE, MRU_TITLE
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            pilot.app.query_one(MruFilesPanel).focus()
+            await pilot.pause()
+            await pilot.press("tab")
+            await pilot.pause()
+            await pilot.pause()
+
+            assert _has_reverse_on_title(
+                pilot.app.query_one(DiffPanel)._renderable, DIFF_TITLE
+            ), "Diff title must be 'reverse' after Tab from MRU"
+            assert not _has_reverse_on_title(
+                pilot.app.query_one(MruFilesPanel)._renderable, MRU_TITLE
+            ), "MRU title must NOT be 'reverse' after focus moved to Diff"

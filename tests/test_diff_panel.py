@@ -405,5 +405,5 @@ class TestMcpCommandRowRenders:
             tool_name="mcp__Server__tool",
         )
         model.record(evt)
-        out = render_commands(model, 120)
+        out = render_commands(model, 0, 120)
         assert "Server::tool" in out.plain
