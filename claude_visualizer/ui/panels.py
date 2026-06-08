@@ -608,6 +608,11 @@ class CommandsPanel(Static):
 # Monitor bar — pluggable per-monitor stacked rows (story #6)
 # ---------------------------------------------------------------------------
 
+# Fallback content width for the MonitorBar before the first layout measures it,
+# so the very first repaint truncates rows to a sensible width (same pattern as
+# the Commands panel's _COMMANDS_DEFAULT_WIDTH in app.py).
+_MONITOR_BAR_DEFAULT_WIDTH = 120
+
 
 def _filter_active_monitor_lines(lines: list) -> list:
     """Return only non-empty entries from a monitor tick result list.
@@ -636,7 +641,7 @@ def _filter_active_monitor_lines(lines: list) -> list:
     return active
 
 
-def render_monitor_bar(lines: list) -> Text:
+def render_monitor_bar(lines: list, width: Optional[int] = None) -> Text:
     """Render a list of monitor lines as a stacked Rich block.
 
     Skips any entry that is an empty string or a ``Text`` whose ``.plain``
@@ -644,14 +649,31 @@ def render_monitor_bar(lines: list) -> Text:
     non-empty lines joined by newlines.  NEVER appends an empty trailing line
     (``Text("")`` appended to a ``Text`` object costs 1 display row — the
     Textual height gotcha).
+
+    When ``width`` is a positive int, each active line is truncated to at most
+    ``width`` cells with a trailing ``…`` ellipsis BEFORE joining.  This is the
+    actual fix for the Textual wrapping bug: Rich's ``Text.no_wrap`` flag is
+    ignored by Textual's compositor, but a line that is already ≤ width cells
+    cannot wrap regardless.  Use ``MonitorBar.update_from_lines`` which passes
+    ``self.content_size.width`` so lines are guaranteed ≤ the widget's content
+    width and ``height: auto`` resolves to exactly the monitor count.
+
+    When ``width`` is ``None`` (the default) no truncation is applied —
+    existing callers and tests are unaffected.
     """
     active = _filter_active_monitor_lines(lines)
     out = Text(no_wrap=True, overflow="ellipsis")
     for i, line in enumerate(active):
+        # Build a per-line Text object so we can truncate it cell-accurately.
         if isinstance(line, Text):
-            out.append_text(line)
+            t = line.copy()
         else:
-            out.append(line)
+            t = Text(str(line))
+        # Truncate to width cells with Rich's cell-aware truncate when requested.
+        # This is the REAL fix: each line ≤ width → Textual cannot wrap it.
+        if width is not None and width > 0:
+            t.truncate(width, overflow="ellipsis")
+        out.append_text(t)
         if i < len(active) - 1:
             out.append("\n")
     return out
@@ -680,15 +702,39 @@ class MonitorBar(Static):
         self._renderable: Text = Text("")
 
     def update_from_lines(self, lines: list) -> None:
-        """Re-render from monitor tick results; collapse to invisible when all empty."""
+        """Re-render from monitor tick results; collapse to invisible when all empty.
+
+        Computes the available content width from ``self.content_size.width``
+        (Textual's measured content region, excluding border/padding) and passes
+        it to :func:`render_monitor_bar` so each active line is truncated to at
+        most that many cells before joining.  This prevents Textual from wrapping
+        long lines inside a ``height: auto`` widget, keeping
+        ``MonitorBar.size.height`` equal to the active monitor count.
+
+        Before the first layout ``content_size.width`` is 0 (unmeasured);
+        :data:`_MONITOR_BAR_DEFAULT_WIDTH` is used as a pre-layout fallback —
+        the periodic refresh tick re-paints with the real width once layout is
+        complete (same pattern as the Commands panel's ``_COMMANDS_DEFAULT_WIDTH``
+        in ``app.py``).
+        """
         active = _filter_active_monitor_lines(lines)
         if not active:
             self.display = False
         else:
             self.display = True
-            self._renderable = render_monitor_bar(lines)
+            width = (
+                self.content_size.width
+                if self.content_size.width > 0
+                else _MONITOR_BAR_DEFAULT_WIDTH
+            )
+            self._renderable = render_monitor_bar(lines, width=width)
             if self.is_mounted:
-                self.refresh()
+                # layout=True is required so Textual re-measures content height for
+                # the ``height: auto`` widget.  A plain refresh() (layout=False) repaints
+                # the content but does NOT trigger a layout pass, so size.height stays
+                # stale at the pre-truncation measurement.  Static.update() uses the
+                # same layout=True pattern for the same reason.
+                self.refresh(layout=True)
 
     def render(self) -> Text:
         """Return the current Rich renderable (Textual repaints from this)."""

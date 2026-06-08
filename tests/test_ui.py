@@ -1582,6 +1582,105 @@ class TestMonitorBarPure:
         result = render_monitor_bar(["", RichText("")])
         assert result.plain == ""
 
+    def test_render_monitor_bar_width_truncates_long_line(self):
+        """render_monitor_bar(width=40) truncates a 200-char line to ≤40 cells ending with …"""
+        long_line = "M" * 200
+        result = render_monitor_bar([long_line, "MON2"], width=40)
+        lines = result.plain.splitlines()
+        first = lines[0]
+        # Truncated to at most 40 cells and ends with the ellipsis.
+        assert len(first) <= 40, f"Expected ≤40 chars, got {len(first)}: {first!r}"
+        assert first.endswith(
+            TRUNCATION_ELLIPSIS
+        ), f"Truncated line must end with '…'; got: {first!r}"
+
+    def test_render_monitor_bar_width_preserves_two_logical_lines(self):
+        """render_monitor_bar(width=40) with 2 monitors → exactly 2 logical lines."""
+        long_line = "N" * 200
+        result = render_monitor_bar([long_line, "MON2"], width=40)
+        lines = result.plain.splitlines()
+        assert (
+            len(lines) == 2
+        ), f"Expected exactly 2 logical lines; got {len(lines)}: {lines!r}"
+        # Second line must contain the short monitor text.
+        assert "MON2" in lines[1], f"Second line must be 'MON2'; got: {lines[1]!r}"
+
+    def test_render_monitor_bar_no_width_arg_untruncated(self):
+        """render_monitor_bar with no width arg preserves full untruncated content (backward compat)."""
+        long_line = "P" * 200
+        result = render_monitor_bar([long_line, "MON2"])
+        lines = result.plain.splitlines()
+        # Without width the content is untruncated (backward compatibility).
+        assert (
+            lines[0] == long_line
+        ), f"Without width the long line must be untruncated; got: {lines[0]!r}"
+        assert len(lines) == 2
+
+    def test_render_monitor_bar_styled_text_truncation_preserves_spans_and_does_not_mutate(
+        self,
+    ):
+        """Styled Text line: truncation keeps bold-red leading span; original not mutated.
+
+        The proxmox monitor returns a rich.text.Text whose leading badge
+        ``⚠ PVE UNREACHABLE`` is styled ``bold red``.  render_monitor_bar must:
+
+        1. Produce exactly 2 logical lines (one per input item).
+        2. Truncate the first line to ≤ 40 cells, ending with ``…``.
+        3. Keep the ``bold red`` span covering the leading badge region.
+        4. NOT mutate the original Text (no cross-tick corruption).
+        """
+        from rich.console import Console
+        from rich.text import Text as RichText
+
+        # Build the styled input — a leading bold-red badge + 200 filler chars.
+        styled_line = RichText()
+        styled_line.append("⚠ PVE UNREACHABLE", style="bold red")
+        styled_line.append(" │ " + "x" * 200)
+        original_plain_len = len(styled_line.plain)
+        original_spans = list(styled_line.spans)  # snapshot for mutation check
+
+        result = render_monitor_bar([styled_line, "MON2"], width=40)
+
+        # -- Assertion 1: exactly 2 logical lines ----------------------------
+        logical_lines = result.plain.splitlines()
+        assert len(logical_lines) == 2, (
+            f"Expected exactly 2 logical lines; got {len(logical_lines)}: "
+            f"{logical_lines!r}"
+        )
+
+        # -- Assertion 2: first line ≤ 40 cells and ends with … --------------
+        first_plain = logical_lines[0]
+        assert (
+            len(first_plain) <= 40
+        ), f"First line must be ≤ 40 cells; got {len(first_plain)}: {first_plain!r}"
+        assert first_plain.endswith(
+            TRUNCATION_ELLIPSIS
+        ), f"First line must end with '…'; got: {first_plain!r}"
+
+        # -- Assertion 3: leading bold-red span survives in the output --------
+        console = Console()
+        style_at_0 = result.get_style_at_offset(console, 0)
+        assert style_at_0.bold, (
+            "Leading span must still be bold after truncation; "
+            f"style at offset 0: {style_at_0!r}"
+        )
+        assert (
+            style_at_0.color is not None and "red" in str(style_at_0.color).lower()
+        ), (
+            "Leading span must still be red after truncation; "
+            f"color at offset 0: {style_at_0.color!r}"
+        )
+
+        # -- Assertion 4: original Text NOT mutated ---------------------------
+        assert len(styled_line.plain) == original_plain_len, (
+            "render_monitor_bar must not mutate the input Text's length; "
+            f"original was {original_plain_len}, now {len(styled_line.plain)}"
+        )
+        assert list(styled_line.spans) == original_spans, (
+            "render_monitor_bar must not mutate the input Text's spans; "
+            f"original: {original_spans!r}, now: {list(styled_line.spans)!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # MonitorBar widget — display/collapse behavior (story #6, AC3)
@@ -1734,6 +1833,80 @@ class TestMonitorBarNarrowTerminal:
             assert len(lines) == 2, (
                 f"MonitorBar must show exactly 2 lines (one per monitor, no wrap); "
                 f"got {len(lines)}: {lines!r}"
+            )
+
+    async def test_monitor_bar_height_equals_active_monitor_count(
+        self, tmp_path: Path
+    ) -> None:
+        """MonitorBar widget size.height must equal the number of active monitors.
+
+        This is the REAL regression guard: it asserts the ACTUAL Textual widget
+        height, not just logical newlines in rendered_text().  Before the
+        truncation fix (``render_monitor_bar(width=...)``), a 200-char monitor
+        line at terminal width=40 causes Textual to wrap it to ~6 extra rows,
+        making ``MonitorBar.size.height ≈ 7`` instead of 2.  After the fix
+        (each line truncated to content_size.width before joining), the widget
+        height equals exactly the number of active monitors (2).
+
+        No network calls: fixture monitors return pure strings.
+        """
+        monitors_dir = tmp_path / "monitors_height"
+        monitors_dir.mkdir(parents=True, exist_ok=True)
+
+        # Monitor A: returns a 200-char line — far wider than terminal width=40.
+        # Before the fix this single logical line wraps to ~6 visual rows in
+        # Textual's compositor, inflating MonitorBar.size.height to ~7.
+        long_line = "HLONG:" + "Y" * 200
+        (monitors_dir / "aaa_long.py").write_text(
+            "class Monitor:\n"
+            "    def tick(self, now):\n"
+            f"        return {long_line!r}\n"
+        )
+
+        # Monitor B: short marker — proves the second monitor is not pushed off.
+        (monitors_dir / "zzz_short.py").write_text(
+            "class Monitor:\n"
+            "    def tick(self, now):\n"
+            "        return 'HSHORT-MARKER'\n"
+        )
+
+        root = tmp_path / "projects"
+        cfg = _fixture_config(root, monitors_dir=monitors_dir)
+        app = VisualizerApp(cfg)
+
+        async with app.run_test(size=(40, 12)) as pilot:
+            bar = pilot.app.query_one(MonitorBar)
+            # Pump until BOTH monitors are populated AND the widget height converges
+            # to 2.  Two phases are needed:
+            #
+            # Phase 1: content appears (monitors tick and update_from_lines fires).
+            #          At this point content_size.width may still be measured at the
+            #          pre-layout size, so the truncation uses _MONITOR_BAR_DEFAULT_WIDTH
+            #          and height may still be > 2.
+            #
+            # Phase 2: the layout=True refresh triggers Textual to re-measure with the
+            #          real content_size.width (38 at size=(40,12)), and height settles
+            #          to 2.  We keep pumping until this converges (bounded loop).
+            for _ in range(80):
+                await pilot.pause()
+                t = bar.rendered_text()
+                if "HLONG" in t and "HSHORT" in t and bar.size.height == 2:
+                    break
+
+            # The ACTUAL widget height must equal the number of active monitors (2).
+            # This fails on the pre-fix code where height ≈ 7 due to line-wrapping.
+            assert bar.size.height == 2, (
+                f"MonitorBar.size.height must equal the active monitor count (2), "
+                f"not {bar.size.height}. A height > 2 means long lines are wrapping "
+                f"inside the widget — each line must be truncated to content_size.width "
+                f"before joining so Textual's compositor sees at most 1 row per monitor. "
+                f"rendered_text: {bar.rendered_text()!r}"
+            )
+
+            # Short monitor marker must still be present (not pushed off by wrapping).
+            assert "HSHORT-MARKER" in bar.rendered_text(), (
+                f"Short monitor must be visible in MonitorBar.rendered_text(); "
+                f"got: {bar.rendered_text()!r}"
             )
 
 
