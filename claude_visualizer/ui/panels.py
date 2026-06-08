@@ -166,6 +166,32 @@ def format_mru_row(entry: MruEntry, highlighted: bool = False) -> str:
     return line
 
 
+def _styled_mru_row(entry: MruEntry, prefix: str) -> Text:
+    """Build an MRU row as a Rich Text with per-field color accents.
+
+    Used for NON-highlighted rows only.  Highlighted rows continue to use the
+    plain :func:`format_mru_row` string with :data:`MRU_HIGHLIGHT_STYLE`
+    because ``bold reverse`` conflicts with per-field foreground colors.
+    """
+    time_str = _format_time(entry.ts)
+    op_tag = f"[{entry.op.value}]"
+    row = Text()
+    row.append(time_str, style="dim")
+    row.append("  ")
+    row.append(prefix)
+    row.append(op_tag, style="dim cyan")
+    row.append(" ")
+    row.append(entry.file_path)
+    row.append("   ")
+    row.append(entry.project_tag, style="dim green")
+    row.append(f" {ORIGIN_SEP} ", style="dim")
+    row.append(entry.short_session, style="dim")
+    if entry.is_subagent:
+        row.append("  ")
+        row.append(SUBAGENT_MARKER, style="dim yellow")
+    return row
+
+
 def render_mru(
     model: MruModel,
     scroll_offset: int = 0,
@@ -207,25 +233,44 @@ def render_mru(
     for index, entry in enumerate(visible):
         is_hl = entry.file_path == model.highlighted_path
         if is_hl:
-            style = MRU_HIGHLIGHT_STYLE
-        elif (scroll_offset + index) % 2 == 1:
-            style = MRU_ROW_STYLE_ODD_FULL
+            # Highlighted rows: plain string + MRU_HIGHLIGHT_STYLE.
+            # bold reverse conflicts with per-field colors; keep plain.
+            row_text = format_mru_row(entry, highlighted=True)
+            if width > 0:
+                line_count = max(1, math.ceil(len(row_text) / width))
+                target = line_count * width
+                padded = row_text + " " * (target - len(row_text))
+                for chunk_start in range(0, target, width):
+                    out.append(
+                        padded[chunk_start : chunk_start + width],
+                        style=MRU_HIGHLIGHT_STYLE,
+                    )
+                    if chunk_start + width < target:
+                        out.append("\n")
+            else:
+                out.append(row_text, style=MRU_HIGHLIGHT_STYLE)
         else:
-            style = MRU_ROW_STYLE_EVEN
-        row_text = format_mru_row(entry, highlighted=is_hl)
-        if width > 0:
-            line_count = max(1, math.ceil(len(row_text) / width))
-            target = line_count * width
-            padded = row_text + " " * (target - len(row_text))
-            # Chunk into width-sized pieces so Rich never word-wraps mid-row.
-            # Word wrapping produces short lines (e.g. 19 chars instead of 38)
-            # leaving the right portion of each visual line without background.
-            for chunk_start in range(0, target, width):
-                out.append(padded[chunk_start : chunk_start + width], style=style)
-                if chunk_start + width < target:
-                    out.append("\n")
-        else:
-            out.append(row_text, style=style)
+            # Non-highlighted rows: Rich Text with per-field color accents.
+            styled_row = _styled_mru_row(entry, _MRU_ROW_INDENT)
+            is_odd = (scroll_offset + index) % 2 == 1
+            if width > 0:
+                plain_len = len(styled_row)
+                line_count = max(1, math.ceil(plain_len / width))
+                target = line_count * width
+                if plain_len < target:
+                    styled_row.append(" " * (target - plain_len))
+                # Apply ONLY background for zebra — don't override field colors.
+                if is_odd:
+                    styled_row.stylize("on #262626")
+                # Chunk into width-sized pieces (Text slicing preserves styles).
+                for chunk_start in range(0, target, width):
+                    out.append_text(styled_row[chunk_start : chunk_start + width])
+                    if chunk_start + width < target:
+                        out.append("\n")
+            else:
+                if is_odd:
+                    styled_row.stylize("on #262626")
+                out.append_text(styled_row)
         if index < len(visible) - 1:
             out.append("\n")
     return out
@@ -672,6 +717,41 @@ def format_command_row(entry: CommandFeedEntry, width: int) -> str:
     return truncate_command(f"{time_prefix}{command}{origin_suffix}", width)
 
 
+def _styled_command_row(entry: CommandFeedEntry, width: int) -> Text:
+    """Build a command-feed row as a Rich Text with per-field color accents.
+
+    The command text is the main content (no style applied); all metadata
+    fields (timestamp, project tag, separator, session, subagent marker) carry
+    subtle ``dim`` tints so they recede visually without disappearing.
+    """
+    time_str = _format_time(entry.ts)
+    time_prefix = f"{time_str}  "
+    origin_parts_plain = f"  {entry.project_tag} {ORIGIN_SEP} {entry.short_session}"
+    if entry.is_subagent:
+        origin_parts_plain += f"  {SUBAGENT_MARKER}"
+    # Truncate the command to fit remaining width.
+    command_width = max(0, width - len(time_prefix) - len(origin_parts_plain))
+    command = truncate_command(entry.command, command_width)
+
+    row = Text()
+    row.append(time_str, style="dim")
+    row.append("  ")
+    row.append(command)  # default — main content, no dim
+    row.append("  ")
+    row.append(entry.project_tag, style="dim green")
+    row.append(f" {ORIGIN_SEP} ", style="dim")
+    row.append(entry.short_session, style="dim magenta")
+    if entry.is_subagent:
+        row.append("  ")
+        row.append(SUBAGENT_MARKER, style="dim yellow")
+
+    # Final width backstop: truncate the whole Text if it's still too wide.
+    if len(row) > width > 0:
+        row.truncate(width - 1)
+        row.append(TRUNCATION_ELLIPSIS)
+    return row
+
+
 def render_commands(
     model: CommandFeedModel,
     scroll_offset: int,
@@ -689,8 +769,9 @@ def render_commands(
     Returns a waiting message (still inside the titled block) when the feed is
     empty or the offset has scrolled past all rows, so the panel never shows a
     blank void before any command is observed.  Each entry is rendered by
-    :func:`format_command_row` truncated to ``width``; the feed is a LOG so
-    identical commands each get their own row (no dedup).
+    :func:`_styled_command_row` (when ``width > 0``) or :func:`format_command_row`
+    (fallback for width ≤ 0); the feed is a LOG so identical commands each get
+    their own row (no dedup).
 
     ``focused`` when True renders the title with ``bold reverse`` so the panel
     title highlights to indicate keyboard focus (no border change, no layout
@@ -708,7 +789,10 @@ def render_commands(
         out.append(COMMANDS_EMPTY_TEXT)
         return out
     for index, entry in enumerate(visible):
-        out.append(format_command_row(entry, width))
+        if width > 0:
+            out.append_text(_styled_command_row(entry, width))
+        else:
+            out.append(format_command_row(entry, width))
         if index < len(visible) - 1:
             out.append("\n")
     return out

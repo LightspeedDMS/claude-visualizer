@@ -34,9 +34,10 @@ from claude_visualizer.diffing import (
     DiffKind,
     DiffSegment,
 )
-from claude_visualizer.events import CommandEvent, FileOp
+from claude_visualizer.events import CommandEvent, FileModifiedEvent, FileOp
 from claude_visualizer.models.command_feed import CommandFeedModel
 from claude_visualizer.models.diff_queue import DisplayState
+from claude_visualizer.models.mru import MruModel
 from claude_visualizer.ui.panels import (
     COMMANDS_TITLE,
     DIFF_EMPTY_TEXT,
@@ -49,6 +50,7 @@ from claude_visualizer.ui.panels import (
     render_commands,
     render_diff,
     render_diff_body,
+    render_mru,
     shorten_model,
 )
 
@@ -407,3 +409,228 @@ class TestMcpCommandRowRenders:
         model.record(evt)
         out = render_commands(model, 0, 120)
         assert "Server::tool" in out.plain
+
+
+# ---------------------------------------------------------------------------
+# Per-field color accents — MRU rows
+# ---------------------------------------------------------------------------
+
+
+def _spans_for_text(text: Text, substring: str) -> list:
+    """Return all spans that cover the first occurrence of ``substring`` in text.
+
+    A span "covers" the substring when the span range overlaps the substring
+    range [start, end).  Used to find what style a named field carries.
+    """
+    plain = text.plain
+    pos = plain.find(substring)
+    if pos == -1:
+        return []
+    end = pos + len(substring)
+    return [s for s in text.spans if s.start <= pos and s.end >= end]
+
+
+def _style_strings_for(text: Text, substring: str) -> list[str]:
+    """Return the style string(s) of every span covering ``substring``."""
+    return [str(s.style) for s in _spans_for_text(text, substring)]
+
+
+def _mru_model_with_entry(
+    *,
+    project_tag: str = "myproject",
+    session_id: str = "aabbccdd1234",
+    is_subagent: bool = False,
+    op: FileOp = FileOp.EDIT,
+    ts: Optional[datetime] = datetime(2024, 3, 5, 9, 10, 11, tzinfo=timezone.utc),
+) -> MruModel:
+    model = MruModel(AppConfig())
+    evt = FileModifiedEvent(
+        ts=ts,
+        session_id=session_id,
+        is_subagent=is_subagent,
+        project_tag=project_tag,
+        source_path="/src/x.jsonl",
+        file_path="/some/path/widget.py",
+        op=op,
+        old_string="old" if op is FileOp.EDIT else None,
+        new_string="new" if op is FileOp.EDIT else None,
+        full_content="content" if op is FileOp.WRITE else None,
+    )
+    model.record(evt)
+    return model
+
+
+class TestMruRowColors:
+    """Non-highlighted MRU rows carry per-field Rich style spans."""
+
+    def test_timestamp_is_dim(self):
+        model = _mru_model_with_entry()
+        text = render_mru(model, 0, 0)
+        # "09:10:11" is the formatted time for the test timestamp
+        styles = _style_strings_for(text, "09:10:11")
+        assert any(
+            "dim" in s for s in styles
+        ), f"expected 'dim' on timestamp; got styles={styles!r}\nfull text={text.plain!r}"
+
+    def test_op_tag_is_dim_cyan(self):
+        model = _mru_model_with_entry(op=FileOp.EDIT)
+        text = render_mru(model, 0, 0)
+        styles = _style_strings_for(text, "[EDIT]")
+        assert any(
+            "dim" in s and "cyan" in s for s in styles
+        ), f"expected 'dim cyan' on op tag; got styles={styles!r}"
+
+    def test_project_tag_is_dim_green(self):
+        model = _mru_model_with_entry(project_tag="myproject")
+        text = render_mru(model, 0, 0)
+        styles = _style_strings_for(text, "myproject")
+        assert any(
+            "dim" in s and "green" in s for s in styles
+        ), f"expected 'dim green' on project tag; got styles={styles!r}"
+
+    def test_separator_is_dim(self):
+        model = _mru_model_with_entry()
+        text = render_mru(model, 0, 0)
+        # The separator " · " appears between project tag and session
+        styles = _style_strings_for(text, " · ")
+        assert any(
+            "dim" in s for s in styles
+        ), f"expected 'dim' on separator; got styles={styles!r}"
+
+    def test_session_hash_is_dim(self):
+        model = _mru_model_with_entry(session_id="aabbccdd1234")
+        text = render_mru(model, 0, 0)
+        # short_session is first 8 chars: "aabbccdd"
+        styles = _style_strings_for(text, "aabbccdd")
+        assert any(
+            "dim" in s for s in styles
+        ), f"expected 'dim' on session hash; got styles={styles!r}"
+
+    def test_subagent_marker_is_dim_yellow(self):
+        model = _mru_model_with_entry(is_subagent=True)
+        text = render_mru(model, 0, 0)
+        styles = _style_strings_for(text, "⤷sub")
+        assert any(
+            "dim" in s and "yellow" in s for s in styles
+        ), f"expected 'dim yellow' on subagent marker; got styles={styles!r}"
+
+    def test_highlighted_row_has_no_per_field_colors(self):
+        """Highlighted rows use bold reverse — no per-field color spans."""
+        model = _mru_model_with_entry(project_tag="hlproject")
+        # Set highlighted_path to trigger highlighted rendering
+        model.highlighted_path = "/some/path/widget.py"
+        text = render_mru(model, 0, 0)
+        # For the highlighted row, per-field color spans must NOT be present.
+        # The only span covering the project tag should be the bold-reverse style.
+        styles = _style_strings_for(text, "hlproject")
+        assert not any(
+            "green" in s for s in styles
+        ), f"highlighted row must not have 'green' on project tag; got={styles!r}"
+        assert not any(
+            "cyan" in s for s in styles
+        ), f"highlighted row must not have 'cyan' on [EDIT]; got={styles!r}"
+
+    def test_file_path_has_no_color_style(self):
+        """The file path is the 'star' — no dim/color style spans cover it."""
+        model = _mru_model_with_entry()
+        text = render_mru(model, 0, 0)
+        # "widget.py" is in the file path — should have no color style spans
+        styles = _style_strings_for(text, "widget.py")
+        # Accept zero spans OR spans that are NOT dim/colored (e.g. background-only)
+        color_spans = [
+            s
+            for s in styles
+            if any(c in s for c in ("cyan", "green", "yellow", "magenta", "red"))
+        ]
+        assert (
+            not color_spans
+        ), f"file path should have no foreground color styles; got={color_spans!r}"
+
+
+# ---------------------------------------------------------------------------
+# Per-field color accents — Commands rows
+# ---------------------------------------------------------------------------
+
+
+def _cmd_model_with_entry(
+    *,
+    command: str = "pytest -q",
+    project_tag: str = "testproject",
+    session_id: str = "11223344abcd",
+    is_subagent: bool = False,
+    ts: Optional[datetime] = datetime(2024, 3, 5, 14, 20, 33, tzinfo=timezone.utc),
+) -> CommandFeedModel:
+    model = CommandFeedModel(AppConfig())
+    evt = CommandEvent(
+        ts=ts,
+        session_id=session_id,
+        is_subagent=is_subagent,
+        project_tag=project_tag,
+        source_path="/src/x.jsonl",
+        command=command,
+        description=None,
+    )
+    model.record(evt)
+    return model
+
+
+class TestCommandRowColors:
+    """Command rows carry per-field Rich style spans when width > 0."""
+
+    def test_timestamp_is_dim(self):
+        model = _cmd_model_with_entry()
+        text = render_commands(model, 0, 120)
+        styles = _style_strings_for(text, "14:20:33")
+        assert any(
+            "dim" in s for s in styles
+        ), f"expected 'dim' on timestamp; got styles={styles!r}"
+
+    def test_project_tag_is_dim_green(self):
+        model = _cmd_model_with_entry(project_tag="testproject")
+        text = render_commands(model, 0, 120)
+        styles = _style_strings_for(text, "testproject")
+        assert any(
+            "dim" in s and "green" in s for s in styles
+        ), f"expected 'dim green' on project tag; got styles={styles!r}"
+
+    def test_separator_is_dim(self):
+        model = _cmd_model_with_entry()
+        text = render_commands(model, 0, 120)
+        styles = _style_strings_for(text, " · ")
+        assert any(
+            "dim" in s for s in styles
+        ), f"expected 'dim' on separator; got styles={styles!r}"
+
+    def test_session_hash_is_dim_magenta(self):
+        model = _cmd_model_with_entry(session_id="11223344abcd")
+        text = render_commands(model, 0, 120)
+        # short_session is first 8 chars: "11223344"
+        styles = _style_strings_for(text, "11223344")
+        assert any(
+            "dim" in s and "magenta" in s for s in styles
+        ), f"expected 'dim magenta' on session hash; got styles={styles!r}"
+
+    def test_subagent_marker_is_dim_yellow(self):
+        model = _cmd_model_with_entry(is_subagent=True)
+        text = render_commands(model, 0, 120)
+        styles = _style_strings_for(text, "⤷sub")
+        assert any(
+            "dim" in s and "yellow" in s for s in styles
+        ), f"expected 'dim yellow' on subagent marker; got styles={styles!r}"
+
+    def test_command_text_has_no_dim_style(self):
+        """The command text is the main content — no dim style."""
+        model = _cmd_model_with_entry(command="pytest -q")
+        text = render_commands(model, 0, 120)
+        styles = _style_strings_for(text, "pytest -q")
+        # Command should have no dim or color style
+        dim_spans = [s for s in styles if "dim" in s]
+        assert not dim_spans, f"command text should not be dim; got={dim_spans!r}"
+
+    def test_no_styled_rows_when_width_zero(self):
+        """When width=0, falls back to plain format_command_row (returns empty row)."""
+        model = _cmd_model_with_entry(project_tag="fallbackproj")
+        text = render_commands(model, 0, 0)
+        # width=0 → format_command_row returns "" (nothing fits), so the
+        # rendered text is just the title header with an empty data row.
+        assert text.plain.startswith("Commands")
