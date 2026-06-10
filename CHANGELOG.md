@@ -12,6 +12,7 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - Home/End keyboard navigation in all three panels (MRU, Diff, Commands) — jumps to the first or last item when the panel is focused.
+- Horizontal scrolling of command text in the Commands panel — `←`/`→` arrow keys (when focused) scroll the command portion of all visible rows as a block, revealing truncated long commands; each row clamps independently so short commands that already fit never scroll; `…` indicators show which direction hidden text lies; scroll position persists across repaints and resets only when a new command arrives.
 
 ### Removed
 

@@ -45,6 +45,7 @@ from claude_visualizer.ui.panels import (
     render_diff,
     render_monitor_bar,
     render_mru,
+    scroll_command,
     truncate_command,
 )
 
@@ -620,6 +621,242 @@ class TestCommandsPanelWidget:
         model.record(_cmd_event(command="make build"))
         panel.update_from_model(model, width=80)
         assert "make build" in panel.rendered_text()
+
+
+# ---------------------------------------------------------------------------
+# scroll_command — horizontal scrolling of command text (new)
+# ---------------------------------------------------------------------------
+
+
+class TestScrollCommand:
+    def test_short_text_no_scroll_unchanged(self):
+        # Text fits width, h_scroll=0 → returned unchanged (no ellipsis added).
+        assert scroll_command("ls -la", width=20, h_scroll=0) == "ls -la"
+
+    def test_short_text_h_scroll_clamps_to_zero(self):
+        # Text fits width, h_scroll=5 → effective scroll = 0 (clamped), unchanged.
+        assert scroll_command("ls -la", width=20, h_scroll=5) == "ls -la"
+
+    def test_long_text_no_scroll_truncated_right(self):
+        # Long text, h_scroll=0 → truncated with TRUNCATION_ELLIPSIS at end.
+        out = scroll_command("x" * 50, width=10, h_scroll=0)
+        assert out.endswith(TRUNCATION_ELLIPSIS)
+        assert len(out) == 10
+        assert not out.startswith(TRUNCATION_ELLIPSIS)
+
+    def test_scrolled_partial_left_ellipsis_and_right_truncation(self):
+        # Long text scrolled by 5: left ellipsis shows hidden text on left,
+        # right truncation shows text still extends to the right.
+        cmd = "A" * 50
+        out = scroll_command(cmd, width=10, h_scroll=5)
+        # Left ellipsis because offset > 0
+        assert out.startswith(TRUNCATION_ELLIPSIS)
+        # Right truncation because remaining text still > width
+        assert out.endswith(TRUNCATION_ELLIPSIS)
+        assert len(out) == 10
+
+    def test_scrolled_to_end_left_ellipsis_no_right_truncation(self):
+        # Scroll just enough so the tail is visible: left ellipsis, no right truncation.
+        # cmd = "A"*50, width=10, max_scroll = 50-10 = 40
+        cmd = "A" * 40 + "ZZZZZZZZZZ"  # last 10 chars are Z
+        out = scroll_command(cmd, width=10, h_scroll=40)
+        assert out.startswith(TRUNCATION_ELLIPSIS)
+        # The visible tail is ZZZZZZZZZZ (10 chars) but first char replaced by …
+        assert out.endswith("ZZZZZZZZZ")  # 9 Z's after the leading …
+        assert len(out) == 10
+
+    def test_h_scroll_past_max_clamps(self):
+        # h_scroll=999 on 50-char text, width=10 → same result as max_scroll=40
+        cmd = "A" * 40 + "ZZZZZZZZZZ"
+        out_max = scroll_command(cmd, width=10, h_scroll=40)
+        out_clamped = scroll_command(cmd, width=10, h_scroll=999)
+        assert out_max == out_clamped
+
+    def test_newlines_collapsed_before_scroll(self):
+        # Multi-line command: newlines become spaces before scroll is applied.
+        out = scroll_command("echo a\necho b", width=40, h_scroll=0)
+        assert "\n" not in out
+        assert "echo a echo b" in out
+
+    def test_width_zero_returns_empty(self):
+        assert scroll_command("anything", width=0, h_scroll=0) == ""
+        assert scroll_command("anything", width=0, h_scroll=5) == ""
+
+    def test_width_one_no_scroll(self):
+        # width=1, h_scroll=0: truncate to 1 char → just the ellipsis
+        out = scroll_command("x" * 10, width=1, h_scroll=0)
+        assert out == TRUNCATION_ELLIPSIS
+
+    def test_width_one_with_scroll(self):
+        # width=1, h_scroll>0 (effective): only the left ellipsis fits
+        out = scroll_command("x" * 10, width=1, h_scroll=3)
+        assert out == TRUNCATION_ELLIPSIS
+
+
+# ---------------------------------------------------------------------------
+# format_command_row with h_scroll
+# ---------------------------------------------------------------------------
+
+
+class TestFormatCommandRowHScroll:
+    def test_h_scroll_zero_preserves_existing_behavior(self):
+        # h_scroll=0 (default) must be identical to no-h_scroll call.
+        entry = _cmd_entry(command="pytest -q")
+        row_default = format_command_row(entry, width=80)
+        row_zero = format_command_row(entry, width=80, h_scroll=0)
+        assert row_default == row_zero
+
+    def test_h_scroll_reveals_tail_origin_stays_fixed(self):
+        # A very long command that gets truncated at h_scroll=0 should reveal its
+        # tail when h_scroll is positive.  The origin suffix must still appear.
+        long_cmd = "A" * 200
+        entry = _cmd_entry(
+            command=long_cmd,
+            project_tag="my-project",
+            short_session="abc12345",
+        )
+        row_scrolled = format_command_row(entry, width=80, h_scroll=50)
+        # Origin must still be present
+        assert "my-project" in row_scrolled
+        assert "abc12345" in row_scrolled
+        # With offset>0 the left-ellipsis marker must appear somewhere in the
+        # command portion, i.e. not at the very start (time prefix is first)
+        # but present in the row.
+        assert TRUNCATION_ELLIPSIS in row_scrolled
+
+
+# ---------------------------------------------------------------------------
+# render_commands with h_scroll
+# ---------------------------------------------------------------------------
+
+
+class TestRenderCommandsHScroll:
+    def test_h_scroll_zero_same_as_default(self):
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        model.record(_cmd_event(command="make test"))
+        text_default = render_commands(model, 0, width=80, focused=False).plain
+        text_zero = render_commands(model, 0, width=80, focused=False, h_scroll=0).plain
+        assert text_default == text_zero
+
+    def test_h_scroll_passed_through_to_rows(self):
+        # A command long enough to be truncated at width=40.
+        long_cmd = "B" * 200
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        model.record(_cmd_event(command=long_cmd))
+        # h_scroll=0: no left ellipsis in the command portion
+        text_no_scroll = render_commands(
+            model, 0, width=40, focused=False, h_scroll=0
+        ).plain
+        # h_scroll=50: left ellipsis should appear
+        text_scrolled = render_commands(
+            model, 0, width=40, focused=False, h_scroll=50
+        ).plain
+        # Both have right truncation ellipsis; scrolled one should have left too
+        assert TRUNCATION_ELLIPSIS in text_scrolled
+        # Scrolled version should differ from unscrolled
+        assert text_scrolled != text_no_scroll
+
+
+# ---------------------------------------------------------------------------
+# CommandsPanel widget — h_scroll key handling
+# ---------------------------------------------------------------------------
+
+
+class TestCommandsPanelHScroll:
+    def test_initial_h_scroll_offset_is_zero(self):
+        panel = CommandsPanel()
+        assert panel._h_scroll_offset == 0
+
+    def test_h_scroll_left_key_increases_offset(self):
+        panel = CommandsPanel()
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        model.record(_cmd_event(command="B" * 200))
+        panel.update_from_model(model, width=80)
+        # Simulate left key press
+        panel._h_scroll_commands(1)
+        assert panel._h_scroll_offset == 1
+
+    def test_h_scroll_right_key_decreases_offset_clamps_at_zero(self):
+        panel = CommandsPanel()
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        model.record(_cmd_event(command="make build"))
+        panel.update_from_model(model, width=80)
+        # At offset=0, pressing right (delta=-1) should clamp at 0
+        panel._h_scroll_commands(-1)
+        assert panel._h_scroll_offset == 0
+
+    def test_h_scroll_offset_decreases_after_increase(self):
+        panel = CommandsPanel()
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        model.record(_cmd_event(command="B" * 200))
+        panel.update_from_model(model, width=80)
+        panel._h_scroll_commands(5)
+        assert panel._h_scroll_offset == 5
+        panel._h_scroll_commands(-2)
+        assert panel._h_scroll_offset == 3
+
+    def test_h_scroll_resets_on_follow_update(self):
+        panel = CommandsPanel()
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        model.record(_cmd_event(command="B" * 200))
+        panel.update_from_model(model, width=80)
+        # Scroll horizontally
+        panel._h_scroll_commands(10)
+        assert panel._h_scroll_offset == 10
+        # _follow is True (we haven't scrolled vertically), so update_from_model resets
+        assert panel._follow is True
+        model.record(_cmd_event(command="new cmd"))
+        panel.update_from_model(model, width=80)
+        assert panel._h_scroll_offset == 0
+
+    def test_h_scroll_preserved_when_not_following(self):
+        panel = CommandsPanel()
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        model.record(_cmd_event(command="first"))
+        model.record(_cmd_event(command="second"))
+        panel.update_from_model(model, width=80)
+        # Scroll vertically to disable follow
+        panel._scroll_commands(1)
+        assert panel._follow is False
+        # Scroll horizontally
+        panel._h_scroll_commands(5)
+        assert panel._h_scroll_offset == 5
+        # Now update model — follow=False so h_scroll should be preserved
+        model.record(_cmd_event(command="third"))
+        panel.update_from_model(model, width=80)
+        assert panel._h_scroll_offset == 5
+
+    def test_h_scroll_not_reset_on_repaint_without_new_commands(self):
+        """Periodic refresh ticks must NOT reset h_scroll when no new command arrived."""
+        panel = CommandsPanel()
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        model.record(_cmd_event(command="B" * 200))
+        panel.update_from_model(model, width=80)
+        # User scrolls horizontally
+        panel._h_scroll_commands(10)
+        assert panel._h_scroll_offset == 10
+        # _follow is still True (no vertical scroll), simulating a periodic refresh
+        assert panel._follow is True
+        # Call update_from_model again with the SAME model (no new commands)
+        panel.update_from_model(model, width=80)
+        # h_scroll must NOT be reset — no new command arrived
+        assert panel._h_scroll_offset == 10
+
+    def test_h_scroll_resets_when_new_command_arrives_and_following(self):
+        """When a new command arrives and _follow is True, h_scroll MUST reset to 0."""
+        panel = CommandsPanel()
+        model = CommandFeedModel(AppConfig(command_feed_max=10))
+        model.record(_cmd_event(command="B" * 200))
+        panel.update_from_model(model, width=80)
+        # User scrolls horizontally
+        panel._h_scroll_commands(10)
+        assert panel._h_scroll_offset == 10
+        assert panel._follow is True
+        # A genuinely new command arrives
+        model.record(_cmd_event(command="new arrival"))
+        panel.update_from_model(model, width=80)
+        # h_scroll MUST reset because a new command arrived while following
+        assert panel._h_scroll_offset == 0
 
 
 def _file_event(

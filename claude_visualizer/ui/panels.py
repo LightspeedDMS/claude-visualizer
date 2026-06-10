@@ -674,6 +674,42 @@ class DiffPanel(Static):
 # ---------------------------------------------------------------------------
 
 
+def scroll_command(text: str, width: int, h_scroll: int) -> str:
+    """Render a command with horizontal scrolling, fitting ``width`` characters.
+
+    Collapses newlines, applies a per-row horizontal scroll offset, and adds
+    ellipsis indicators so the user can see which direction hidden text lies:
+
+    - ``width <= 0`` → empty string.
+    - ``effective_scroll = min(h_scroll, max(0, len(single_line) - width))``
+      (the raw ``h_scroll`` is clamped so you cannot scroll past the last visible
+      character).
+    - If the remaining visible slice is still longer than ``width``, it is
+      truncated with a trailing ``…`` (text extends to the right).
+    - If ``effective_scroll > 0`` the first character of the result is replaced
+      with ``…`` (text hidden to the left).
+
+    This means both indicators can appear simultaneously when the command is
+    long enough that neither end is visible in the current window.
+    """
+    if width <= 0:
+        return ""
+    single_line = " ".join(text.split("\n"))
+    effective = min(max(0, h_scroll), max(0, len(single_line) - width))
+    visible = single_line[effective:]
+    # Truncate right if still too long
+    if len(visible) > width:
+        if width == 1:
+            return TRUNCATION_ELLIPSIS
+        visible = visible[: width - 1] + TRUNCATION_ELLIPSIS
+    # Add left ellipsis if scrolled (replace first char to keep total width)
+    if effective > 0:
+        if len(visible) == 0:
+            return TRUNCATION_ELLIPSIS
+        visible = TRUNCATION_ELLIPSIS + visible[1:]
+    return visible
+
+
 def truncate_command(text: str, width: int) -> str:
     """Fit a command string onto ONE row of ``width`` characters (AC3).
 
@@ -709,18 +745,21 @@ def _format_time(ts: Optional[datetime]) -> str:
     return ts.strftime(TIME_FORMAT)
 
 
-def format_command_row(entry: CommandFeedEntry, width: int) -> str:
+def format_command_row(entry: CommandFeedEntry, width: int, h_scroll: int = 0) -> str:
     """Render one command-feed entry as a single line that fits ``width`` (AC3).
 
     Layout: ``<time>  <command>  <project> · <short_session>`` with a trailing
     ``⤷sub`` marker when the source is a subagent.  The TIME is the fixed-width
-    leftmost prefix; the COMMAND is the flexible middle field truncated by
-    :func:`truncate_command` to whatever space remains after reserving room for
-    the prefix and the origin suffix; the ORIGIN is the fixed right suffix.  As
-    a final backstop the assembled row is itself passed through
-    :func:`truncate_command` so the WHOLE row is guaranteed to fit ``width``
-    even on a panel so narrow that the prefix + suffix alone would overflow.
-    The row is single-line.
+    leftmost prefix; the COMMAND is the flexible middle field rendered by
+    :func:`scroll_command` (which handles both horizontal scrolling and right
+    truncation) to whatever space remains after reserving room for the prefix
+    and the origin suffix; the ORIGIN is the fixed right suffix.  As a final
+    backstop the assembled row is itself passed through :func:`truncate_command`
+    so the WHOLE row is guaranteed to fit ``width`` even on a panel so narrow
+    that the prefix + suffix alone would overflow.  The row is single-line.
+
+    ``h_scroll`` offsets the command text window to the right (revealing the
+    tail of a long command); the origin suffix always stays fixed.
     """
     time_str = _format_time(entry.ts)
     origin = f"{entry.project_tag} {ORIGIN_SEP} {entry.short_session}"
@@ -734,25 +773,29 @@ def format_command_row(entry: CommandFeedEntry, width: int) -> str:
     # The final truncate is the backstop that makes ``len(row) <= width``
     # hold unconditionally.
     command_width = max(0, width - len(time_prefix) - len(origin_suffix))
-    command = truncate_command(entry.command, command_width)
+    command = scroll_command(entry.command, command_width, h_scroll)
     return truncate_command(f"{time_prefix}{command}{origin_suffix}", width)
 
 
-def _styled_command_row(entry: CommandFeedEntry, width: int) -> Text:
+def _styled_command_row(entry: CommandFeedEntry, width: int, h_scroll: int = 0) -> Text:
     """Build a command-feed row as a Rich Text with per-field color accents.
 
     The command text is the main content (no style applied); all metadata
     fields (timestamp, project tag, separator, session, subagent marker) carry
     subtle ``dim`` tints so they recede visually without disappearing.
+
+    ``h_scroll`` offsets the command text window; origin fields are always fixed.
+    The leading ``…`` added by :func:`scroll_command` when scrolled carries no
+    special style (same as the command text).
     """
     time_str = _format_time(entry.ts)
     time_prefix = f"{time_str}  "
     origin_parts_plain = f"  {entry.project_tag} {ORIGIN_SEP} {entry.short_session}"
     if entry.is_subagent:
         origin_parts_plain += f"  {SUBAGENT_MARKER}"
-    # Truncate the command to fit remaining width.
+    # Scroll/truncate the command to fit remaining width.
     command_width = max(0, width - len(time_prefix) - len(origin_parts_plain))
-    command = truncate_command(entry.command, command_width)
+    command = scroll_command(entry.command, command_width, h_scroll)
 
     row = Text()
     row.append(time_str, style="dim")
@@ -779,6 +822,7 @@ def render_commands(
     width: int,
     *,
     focused: bool = False,
+    h_scroll: int = 0,
 ) -> Text:
     """Render the command feed newest-on-top as a Rich block (AC1/AC2).
 
@@ -797,6 +841,9 @@ def render_commands(
     ``focused`` when True renders the title with ``bold reverse`` so the panel
     title highlights to indicate keyboard focus (no border change, no layout
     shift).
+
+    ``h_scroll`` offsets the command text in every visible row; the per-row
+    clamping in :func:`scroll_command` ensures short commands are unaffected.
     """
     out = Text()
     title_style = "bold reverse" if focused else "bold"
@@ -811,9 +858,9 @@ def render_commands(
         return out
     for index, entry in enumerate(visible):
         if width > 0:
-            out.append_text(_styled_command_row(entry, width))
+            out.append_text(_styled_command_row(entry, width, h_scroll))
         else:
-            out.append(format_command_row(entry, width))
+            out.append(format_command_row(entry, width, h_scroll))
         if index < len(visible) - 1:
             out.append("\n")
     return out
@@ -844,24 +891,35 @@ class CommandsPanel(Static):
         self._follow: bool = True
         self._last_model: Optional[CommandFeedModel] = None
         self._last_width: int = 0
+        self._h_scroll_offset: int = 0
+        self._last_row_count: int = 0
 
     def update_from_model(self, model: CommandFeedModel, width: int) -> None:
         """Re-render the panel from the model's current rows at ``width``.
 
         When ``_follow`` is True the scroll offset is reset to 0 so the newest
-        command stays visible (autoscroll-follow).  When ``_follow`` is False
-        (user has manually scrolled) the offset is preserved and only clamped so
-        it cannot exceed the last valid row index.
+        command stays visible (autoscroll-follow), and ``_h_scroll_offset`` is
+        also reset to 0 so a new command always starts at the left edge.  When
+        ``_follow`` is False (user has manually scrolled) both offsets are
+        preserved so the user is not yanked away from their current view.
         """
         self._last_model = model
         self._last_width = width
         rows = model.rows()
+        row_count = len(rows)
         if self._follow:
             self._scroll_offset = 0
+            if row_count != self._last_row_count:
+                self._h_scroll_offset = 0
         else:
-            self._scroll_offset = min(self._scroll_offset, max(0, len(rows) - 1))
+            self._scroll_offset = min(self._scroll_offset, max(0, row_count - 1))
+        self._last_row_count = row_count
         self._renderable = render_commands(
-            model, self._scroll_offset, width, focused=self.has_focus
+            model,
+            self._scroll_offset,
+            width,
+            focused=self.has_focus,
+            h_scroll=self._h_scroll_offset,
         )
         if self.is_mounted:
             self.refresh()
@@ -885,6 +943,28 @@ class CommandsPanel(Static):
             self._scroll_offset,
             self._last_width,
             focused=self.has_focus,
+            h_scroll=self._h_scroll_offset,
+        )
+        if self.is_mounted:
+            self.refresh()
+
+    def _h_scroll_commands(self, delta: int) -> None:
+        """Adjust ``_h_scroll_offset`` by ``delta`` and repaint.
+
+        The panel-level offset is a "desired" offset; per-row clamping in
+        :func:`scroll_command` handles the upper bound so short commands are
+        never over-scrolled.  The floor is 0 — you cannot scroll left of the
+        start of a command.
+        """
+        self._h_scroll_offset = max(0, self._h_scroll_offset + delta)
+        if self._last_model is None:
+            return
+        self._renderable = render_commands(
+            self._last_model,
+            self._scroll_offset,
+            self._last_width,
+            focused=self.has_focus,
+            h_scroll=self._h_scroll_offset,
         )
         if self.is_mounted:
             self.refresh()
@@ -893,7 +973,11 @@ class CommandsPanel(Static):
         if self._last_model is None:
             return
         self._renderable = render_commands(
-            self._last_model, self._scroll_offset, self._last_width, focused=has_focus
+            self._last_model,
+            self._scroll_offset,
+            self._last_width,
+            focused=has_focus,
+            h_scroll=self._h_scroll_offset,
         )
         if self.is_mounted:
             self.refresh()
@@ -915,7 +999,7 @@ class CommandsPanel(Static):
         return max(1, self.content_size.height - _PANEL_TITLE_CHROME)
 
     def on_key(self, event) -> None:
-        """↑/↓/PageUp/PageDown scroll the Commands row window when this panel is focused."""
+        """↑/↓/PageUp/PageDown scroll the Commands row window; ←/→ scroll command text."""
         if event.key == "up":
             self._scroll_commands(-1)
             event.stop()
@@ -933,6 +1017,14 @@ class CommandsPanel(Static):
             event.stop()
         elif event.key == "end":
             self._scroll_commands(_SCROLL_TO_EXTREME)
+            event.stop()
+        elif event.key == "left":
+            # Slide command text LEFT → reveal more of the tail (increase offset)
+            self._h_scroll_commands(1)
+            event.stop()
+        elif event.key == "right":
+            # Slide command text RIGHT → reveal more of the start (decrease offset)
+            self._h_scroll_commands(-1)
             event.stop()
 
     def render(self) -> Text:
