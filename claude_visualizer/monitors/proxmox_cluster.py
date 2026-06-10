@@ -124,6 +124,7 @@ class ProxmoxSnapshot:
     alerts: List[Alert]
     fetched_at: float
     quorate: bool = True  # Defect 4: from type=="cluster" entry in /cluster/status
+    ceph_total_bytes: float = 0.0  # 0.0 = unknown (no pgmap data) → suppress free token
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +310,26 @@ _COLOUR_FOR_CEPH: Dict[str, str] = {
     "HEALTH_ERR": "red",
 }
 
+# Ceph free-space colour thresholds (free-space based, matching capacity-alert tiers)
+_CEPH_FREE_RED_THRESHOLD: float = 10.0  # free < 10%  → red
+_CEPH_FREE_YELLOW_THRESHOLD: float = 25.0  # free < 25%  → yellow (else green)
+
+
+def _colour_for_ceph_free_pct(free_pct: float) -> str:
+    """Return a Rich colour name for the given Ceph free-space percentage.
+
+    Thresholds (free-space based, consistent with capacity-alert tiers):
+      free_pct <  10.0  → 'red'
+      free_pct <  25.0  → 'yellow'
+      else              → 'green'
+    """
+    if free_pct < _CEPH_FREE_RED_THRESHOLD:
+        return "red"
+    if free_pct < _CEPH_FREE_YELLOW_THRESHOLD:
+        return "yellow"
+    return "green"
+
+
 _COLOUR_FOR_ALERT_SEV: Dict[Severity, str] = {
     Severity.CRIT: "red",
     Severity.WARN: "yellow",
@@ -366,6 +387,13 @@ def render_proxmox_bar(
     ceph_colour = _COLOUR_FOR_CEPH.get(snapshot.ceph_status, "yellow")
     out.append("Ceph: ")
     out.append(snapshot.ceph_status, style=ceph_colour)
+
+    # Compact free-space token: only when capacity data is known (honesty guard).
+    # ceph_total_bytes == 0.0 means unknown (no pgmap) → suppress to avoid fabrication.
+    if snapshot.ceph_total_bytes > 0:
+        free_pct = (1.0 - snapshot.ceph_used_pct) * 100.0
+        out.append(" · ", style="dim")
+        out.append(f"{free_pct:.0f}% free", style=_colour_for_ceph_free_pct(free_pct))
 
     out.append(" │ ", style="dim")
 
@@ -706,9 +734,11 @@ class Monitor:
         ceph_health_status: str = ceph_health_block.get("status", "HEALTH_UNKNOWN")
 
         # Ceph capacity
+        # HONESTY: default bytes_total=0 (not 1) so absent pgmap → ceph_total_bytes=0
+        # → free-space token suppressed in renderer (no fabricated "100% free").
         pgmap = ceph_status.get("pgmap", {})
         bytes_used = float(pgmap.get("bytes_used", 0))
-        bytes_total = float(pgmap.get("bytes_total", 1) or 1)
+        bytes_total = float(pgmap.get("bytes_total", 0) or 0)
         ceph_used_pct = bytes_used / bytes_total if bytes_total > 0 else 0.0
 
         alerts = build_alerts(
@@ -723,6 +753,7 @@ class Monitor:
             osds=osd_states,
             ceph_status=ceph_health_status,
             ceph_used_pct=ceph_used_pct,
+            ceph_total_bytes=bytes_total,
             alerts=alerts,
             fetched_at=time.monotonic(),
             quorate=quorate,

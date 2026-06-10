@@ -2409,6 +2409,280 @@ class TestRecoveryAfterFailure:
             server_thread.join(timeout=2.0)
 
 
+# ---------------------------------------------------------------------------
+# NEW: Ceph free-space token (compact indicator on health line)
+# ---------------------------------------------------------------------------
+
+
+class TestCephFreeToken:
+    """render_proxmox_bar: compact ` · NN% free` token appended to Ceph section.
+
+    Color thresholds (free-space based):
+      free < 10%  → red    (used > 90%)
+      free < 25%  → yellow (used > 75%)
+      else        → green
+
+    Honesty guard: when ceph_total_bytes == 0 (unknown), token is SUPPRESSED.
+    """
+
+    def _make_snapshot_with_capacity(
+        self,
+        *,
+        ceph_used_pct: float,
+        ceph_total_bytes: float,
+        ceph_status: str = "HEALTH_OK",
+    ):
+        from claude_visualizer.monitors.proxmox_cluster import (
+            NodeState,
+            OSDState,
+            ProxmoxSnapshot,
+        )
+
+        return ProxmoxSnapshot(
+            nodes=[NodeState(name="pve1", online=True, cpu_pct=30.0, mem_pct=40.0)],
+            osds=[OSDState(id=0, up=True, in_=True)],
+            ceph_status=ceph_status,
+            ceph_used_pct=ceph_used_pct,
+            ceph_total_bytes=ceph_total_bytes,
+            alerts=[],
+            fetched_at=0.0,
+            quorate=True,
+        )
+
+    # --- Test 1: free token present and green when used=0.38 → 62% free ---------
+
+    def test_62pct_free_appears_in_plain_text(self) -> None:
+        """used=0.38 → free=0.62 → '62% free' in plain text."""
+        from claude_visualizer.monitors.proxmox_cluster import render_proxmox_bar
+
+        snap = self._make_snapshot_with_capacity(
+            ceph_used_pct=0.38, ceph_total_bytes=1_000_000_000_000
+        )
+        result = render_proxmox_bar(snap, 0)
+        assert (
+            "62% free" in result.plain
+        ), f"Expected '62% free' in plain text, got: {result.plain!r}"
+
+    def test_62pct_free_token_is_green(self) -> None:
+        """used=0.38 → free=62% → token styled green."""
+        from rich.console import Console
+
+        from claude_visualizer.monitors.proxmox_cluster import render_proxmox_bar
+
+        snap = self._make_snapshot_with_capacity(
+            ceph_used_pct=0.38, ceph_total_bytes=1_000_000_000_000
+        )
+        result = render_proxmox_bar(snap, 0)
+        idx = result.plain.find("62% free")
+        assert idx >= 0, f"'62% free' not found in: {result.plain!r}"
+        style = str(result.get_style_at_offset(Console(), idx))
+        assert (
+            "green" in style.lower()
+        ), f"Expected green style at '62% free', got: {style!r}"
+
+    def test_dim_separator_before_free_token(self) -> None:
+        """The ` · ` separator between ceph status and free token must be present."""
+        from claude_visualizer.monitors.proxmox_cluster import render_proxmox_bar
+
+        snap = self._make_snapshot_with_capacity(
+            ceph_used_pct=0.38, ceph_total_bytes=1_000_000_000_000
+        )
+        result = render_proxmox_bar(snap, 0)
+        # The rendered plain text should contain the separator
+        assert (
+            " · " in result.plain or "·" in result.plain
+        ), f"Expected '·' separator, got: {result.plain!r}"
+
+    # --- Test 2: Color thresholds -------------------------------------------------
+
+    def test_5pct_free_is_red(self) -> None:
+        """used=0.95 → free=5% → red."""
+        from rich.console import Console
+
+        from claude_visualizer.monitors.proxmox_cluster import render_proxmox_bar
+
+        snap = self._make_snapshot_with_capacity(
+            ceph_used_pct=0.95, ceph_total_bytes=1_000_000_000_000
+        )
+        result = render_proxmox_bar(snap, 0)
+        idx = result.plain.find("5% free")
+        assert idx >= 0, f"'5% free' not found in: {result.plain!r}"
+        style = str(result.get_style_at_offset(Console(), idx))
+        assert (
+            "red" in style.lower()
+        ), f"Expected red style at '5% free' (used=0.95), got: {style!r}"
+
+    def test_20pct_free_is_yellow(self) -> None:
+        """used=0.80 → free=20% → yellow."""
+        from rich.console import Console
+
+        from claude_visualizer.monitors.proxmox_cluster import render_proxmox_bar
+
+        snap = self._make_snapshot_with_capacity(
+            ceph_used_pct=0.80, ceph_total_bytes=1_000_000_000_000
+        )
+        result = render_proxmox_bar(snap, 0)
+        idx = result.plain.find("20% free")
+        assert idx >= 0, f"'20% free' not found in: {result.plain!r}"
+        style = str(result.get_style_at_offset(Console(), idx))
+        assert (
+            "yellow" in style.lower()
+        ), f"Expected yellow style at '20% free' (used=0.80), got: {style!r}"
+
+    def test_70pct_free_is_green(self) -> None:
+        """used=0.30 → free=70% → green."""
+        from rich.console import Console
+
+        from claude_visualizer.monitors.proxmox_cluster import render_proxmox_bar
+
+        snap = self._make_snapshot_with_capacity(
+            ceph_used_pct=0.30, ceph_total_bytes=1_000_000_000_000
+        )
+        result = render_proxmox_bar(snap, 0)
+        idx = result.plain.find("70% free")
+        assert idx >= 0, f"'70% free' not found in: {result.plain!r}"
+        style = str(result.get_style_at_offset(Console(), idx))
+        assert (
+            "green" in style.lower()
+        ), f"Expected green style at '70% free' (used=0.30), got: {style!r}"
+
+    # --- Test 3: Honesty guard — no token when ceph_total_bytes == 0 -------------
+
+    def test_no_free_token_when_total_bytes_zero(self) -> None:
+        """ceph_total_bytes==0 → unknown capacity → NO '% free' token rendered."""
+        from claude_visualizer.monitors.proxmox_cluster import render_proxmox_bar
+
+        snap = self._make_snapshot_with_capacity(
+            ceph_used_pct=0.0, ceph_total_bytes=0.0
+        )
+        result = render_proxmox_bar(snap, 0)
+        assert (
+            "free" not in result.plain
+        ), f"No free token expected when ceph_total_bytes==0, got: {result.plain!r}"
+
+    def test_ceph_section_unchanged_when_total_bytes_zero(self) -> None:
+        """ceph_total_bytes==0 → Ceph section shows status only, no extra tokens."""
+        from claude_visualizer.monitors.proxmox_cluster import render_proxmox_bar
+
+        snap = self._make_snapshot_with_capacity(
+            ceph_used_pct=0.0, ceph_total_bytes=0.0, ceph_status="HEALTH_OK"
+        )
+        result = render_proxmox_bar(snap, 0)
+        assert (
+            "Ceph: HEALTH_OK" in result.plain
+        ), f"Ceph status must still render normally, got: {result.plain!r}"
+
+    # --- Test 4: _parse sets ceph_total_bytes correctly --------------------------
+
+    def test_parse_with_pgmap_bytes_sets_ceph_total_bytes(self) -> None:
+        """`_parse` with pgmap bytes_total=1TB → ceph_total_bytes=1_000_000_000_000."""
+        from claude_visualizer.monitors.proxmox_cluster import Monitor
+
+        ceph_with_capacity = {
+            "health": {"status": "HEALTH_OK", "checks": {}},
+            "pgmap": {
+                "bytes_used": 380_000_000_000,
+                "bytes_total": 1_000_000_000_000,
+            },
+        }
+        m = Monitor.__new__(Monitor)
+        snap = m._parse(
+            cluster_status=_CLUSTER_STATUS_OK,
+            ceph_status=ceph_with_capacity,
+            ha_resources=_HA_RESOURCES_OK,
+            nodes=_NODES_OK,
+            osd_tree=None,
+        )
+        assert snap.ceph_total_bytes == pytest.approx(
+            1_000_000_000_000
+        ), f"ceph_total_bytes must match bytes_total, got: {snap.ceph_total_bytes}"
+        assert snap.ceph_used_pct == pytest.approx(
+            0.38
+        ), f"ceph_used_pct must be 380/1000=0.38, got: {snap.ceph_used_pct}"
+
+    def test_parse_without_pgmap_yields_total_bytes_zero(self) -> None:
+        """`_parse` with NO pgmap → ceph_total_bytes=0.0 (unknown, no fabrication)."""
+        from claude_visualizer.monitors.proxmox_cluster import Monitor
+
+        ceph_no_pgmap = {
+            "health": {"status": "HEALTH_OK", "checks": {}},
+        }
+        m = Monitor.__new__(Monitor)
+        snap = m._parse(
+            cluster_status=_CLUSTER_STATUS_OK,
+            ceph_status=ceph_no_pgmap,
+            ha_resources=_HA_RESOURCES_OK,
+            nodes=_NODES_OK,
+            osd_tree=None,
+        )
+        assert (
+            snap.ceph_total_bytes == 0.0
+        ), f"Missing pgmap must yield ceph_total_bytes=0.0, got: {snap.ceph_total_bytes}"
+        assert (
+            snap.ceph_used_pct == 0.0
+        ), f"Missing pgmap must yield ceph_used_pct=0.0, got: {snap.ceph_used_pct}"
+
+    def test_parse_with_pgmap_bytes_total_zero_yields_zero(self) -> None:
+        """`_parse` with pgmap bytes_total=0 → ceph_total_bytes=0.0, no div-by-zero."""
+        from claude_visualizer.monitors.proxmox_cluster import Monitor
+
+        ceph_zero_total = {
+            "health": {"status": "HEALTH_OK", "checks": {}},
+            "pgmap": {
+                "bytes_used": 100,
+                "bytes_total": 0,
+            },
+        }
+        m = Monitor.__new__(Monitor)
+        snap = m._parse(
+            cluster_status=_CLUSTER_STATUS_OK,
+            ceph_status=ceph_zero_total,
+            ha_resources=_HA_RESOURCES_OK,
+            nodes=_NODES_OK,
+            osd_tree=None,
+        )
+        assert snap.ceph_total_bytes == 0.0
+        assert snap.ceph_used_pct == 0.0
+
+    # --- Test 5: _colour_for_ceph_free_pct unit tests at boundaries --------------
+
+    def test_colour_helper_below_10pct_is_red(self) -> None:
+        """free_pct < 10 → 'red'."""
+        from claude_visualizer.monitors.proxmox_cluster import _colour_for_ceph_free_pct
+
+        assert _colour_for_ceph_free_pct(9.9) == "red"
+
+    def test_colour_helper_at_10pct_is_yellow(self) -> None:
+        """free_pct == 10.0 → 'yellow' (boundary: not < 10)."""
+        from claude_visualizer.monitors.proxmox_cluster import _colour_for_ceph_free_pct
+
+        assert _colour_for_ceph_free_pct(10.0) == "yellow"
+
+    def test_colour_helper_below_25pct_is_yellow(self) -> None:
+        """free_pct == 24.9 → 'yellow' (< 25 but >= 10)."""
+        from claude_visualizer.monitors.proxmox_cluster import _colour_for_ceph_free_pct
+
+        assert _colour_for_ceph_free_pct(24.9) == "yellow"
+
+    def test_colour_helper_at_25pct_is_green(self) -> None:
+        """free_pct == 25.0 → 'green' (boundary: not < 25)."""
+        from claude_visualizer.monitors.proxmox_cluster import _colour_for_ceph_free_pct
+
+        assert _colour_for_ceph_free_pct(25.0) == "green"
+
+    def test_colour_helper_above_25pct_is_green(self) -> None:
+        """free_pct == 62.0 → 'green'."""
+        from claude_visualizer.monitors.proxmox_cluster import _colour_for_ceph_free_pct
+
+        assert _colour_for_ceph_free_pct(62.0) == "green"
+
+    def test_colour_helper_zero_is_red(self) -> None:
+        """free_pct == 0.0 → 'red' (completely full)."""
+        from claude_visualizer.monitors.proxmox_cluster import _colour_for_ceph_free_pct
+
+        assert _colour_for_ceph_free_pct(0.0) == "red"
+
+
 class TestOsdEndpointFailure:
     """Nit 2: /nodes/{node}/ceph/osd returning HTTP 500 → graceful degrade.
 

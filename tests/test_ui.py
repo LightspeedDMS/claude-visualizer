@@ -1763,6 +1763,139 @@ class TestRenderStatusBar:
         )
 
 
+class TestRenderStatusBarVolumeSegment:
+    """Tests for the rotating volume free-space segment added to render_status_bar."""
+
+    def _snap_with_volumes(self, *vols):
+        """Build a SystemStatsSnapshot carrying the given VolumeUsage entries."""
+        from claude_visualizer.models.system_stats import (
+            SystemStatsSnapshot,
+            VolumeUsage,
+        )
+
+        return SystemStatsSnapshot(
+            cpu_pct=10.0,
+            ram_pct=50.0,
+            ram_free_bytes=2_000_000_000,
+            disk_read_bps=0.0,
+            disk_write_bps=0.0,
+            net_down_bps=0.0,
+            net_up_bps=0.0,
+            volumes=tuple(VolumeUsage(mountpoint=mp, free_pct=fp) for mp, fp in vols),
+        )
+
+    def test_volume_index_0_shows_first_mount(self):
+        """volume_index=0 renders the first VolumeUsage entry."""
+        from claude_visualizer.monitors.zzz_machine_stats import render_status_bar
+
+        snap = self._snap_with_volumes(("/data", 73.0), ("/home", 45.0))
+        text = render_status_bar(snap, volume_index=0)
+        assert "/data" in text.plain
+        assert "73% free" in text.plain
+        assert "↻" in text.plain  # ↻ rotation marker
+
+    def test_volume_index_1_shows_second_mount(self):
+        """volume_index=1 renders the second VolumeUsage entry."""
+        from claude_visualizer.monitors.zzz_machine_stats import render_status_bar
+
+        snap = self._snap_with_volumes(("/data", 73.0), ("/home", 45.0))
+        text = render_status_bar(snap, volume_index=1)
+        assert "/home" in text.plain
+        assert "45% free" in text.plain
+
+    def test_volume_index_wraps_around(self):
+        """volume_index=2 wraps to index 0 for a 2-entry volumes tuple."""
+        from claude_visualizer.monitors.zzz_machine_stats import render_status_bar
+
+        snap = self._snap_with_volumes(("/data", 73.0), ("/home", 45.0))
+        text = render_status_bar(snap, volume_index=2)
+        assert "/data" in text.plain
+        assert "73% free" in text.plain
+
+    def test_free_pct_5_renders_red(self):
+        """free_pct=5 (< 10%) must render the volume segment in red."""
+        from claude_visualizer.monitors.zzz_machine_stats import render_status_bar
+
+        snap = self._snap_with_volumes(("/mnt", 5.0))
+        text = render_status_bar(snap, volume_index=0)
+        red_spans = [s for s in text.spans if "red" in str(s.style)]
+        assert red_spans, "Expected red style for free_pct=5 (< 10%)"
+
+    def test_free_pct_20_renders_yellow(self):
+        """free_pct=20 (>= 10%, < 25%) must render the volume segment in yellow."""
+        from claude_visualizer.monitors.zzz_machine_stats import render_status_bar
+
+        snap = self._snap_with_volumes(("/mnt", 20.0))
+        text = render_status_bar(snap, volume_index=0)
+        yellow_spans = [s for s in text.spans if "yellow" in str(s.style)]
+        assert yellow_spans, "Expected yellow style for free_pct=20 (10–25%)"
+
+    def test_free_pct_70_renders_green(self):
+        """free_pct=70 (>= 25%) must render the volume segment in green."""
+        from claude_visualizer.monitors.zzz_machine_stats import render_status_bar
+
+        snap = self._snap_with_volumes(("/mnt", 70.0))
+        text = render_status_bar(snap, volume_index=0)
+        green_spans = [s for s in text.spans if "green" in str(s.style)]
+        assert green_spans, "Expected green style for free_pct=70 (>= 25%)"
+
+    def test_empty_volumes_no_rotation_marker(self):
+        """When snapshot.volumes is empty, rendered text has no ↻ and no 'free' token."""
+        from claude_visualizer.monitors.zzz_machine_stats import render_status_bar
+
+        snap = _snapshot()  # uses the existing helper — no volumes field set
+        text = render_status_bar(snap)
+        assert "↻" not in text.plain, "Should have no ↻ when volumes is empty"
+        # Also ensure no volume-specific 'free' suffix (RAM uses ' free' with a space)
+        # The volume segment would produce e.g. '73% free'; RAM produces '  3.7G free'.
+        # Check the plain text has no '% free' pattern.
+        assert "% free" not in text.plain
+
+    def test_monitor_tick_rotates_volume_via_clock(self):
+        """Monitor.tick(now) passes volume_index=int(now/10) so different now values select different volumes."""
+        from unittest.mock import patch
+
+        from claude_visualizer.models.system_stats import VolumeUsage
+        from claude_visualizer.monitors.zzz_machine_stats import (
+            _VOLUME_ROTATE_SECONDS,
+            Monitor,
+        )
+
+        vol_a = VolumeUsage(mountpoint="/alpha", free_pct=80.0)
+        vol_b = VolumeUsage(mountpoint="/beta", free_pct=60.0)
+
+        # Two now values 10s apart should select different volume slots.
+        now_0 = 0.0  # index = int(0.0 / 10.0) = 0 → /alpha
+        now_10 = _VOLUME_ROTATE_SECONDS  # index = 1 → /beta
+
+        snap_with_two = _snapshot()
+        # We'll patch the model's tick to return a snapshot with two volumes.
+        from claude_visualizer.models.system_stats import SystemStatsSnapshot
+
+        base_snap = SystemStatsSnapshot(
+            cpu_pct=snap_with_two.cpu_pct,
+            ram_pct=snap_with_two.ram_pct,
+            ram_free_bytes=snap_with_two.ram_free_bytes,
+            disk_read_bps=0.0,
+            disk_write_bps=0.0,
+            net_down_bps=0.0,
+            net_up_bps=0.0,
+            volumes=(vol_a, vol_b),
+        )
+
+        monitor = Monitor()
+        with patch.object(monitor._model, "tick", return_value=base_snap):
+            text_0 = monitor.tick(now_0)
+            text_10 = monitor.tick(now_10)
+
+        assert (
+            "/alpha" in text_0.plain
+        ), f"Expected /alpha at now=0, got: {text_0.plain}"
+        assert (
+            "/beta" in text_10.plain
+        ), f"Expected /beta at now=10, got: {text_10.plain}"
+
+
 class TestFmtRate:
     """Tests 15-19: _fmt_rate auto-scaling and fixed-width padding.
 

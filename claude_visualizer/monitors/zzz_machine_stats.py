@@ -41,6 +41,13 @@ _STATS_GREEN = "green"
 _STATS_YELLOW = "yellow"
 _STATS_RED = "red"
 
+# Volume free-space rotation: advance to the next mount every 10 seconds.
+_VOLUME_ROTATE_SECONDS = 10.0
+
+# Color thresholds for free-space percentage (free < X → color).
+_VOLUME_RED_THRESHOLD = 10.0  # < 10% free → red
+_VOLUME_YELLOW_THRESHOLD = 25.0  # < 25% free → yellow; else green
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers (relocated from ui/panels.py)
@@ -51,6 +58,21 @@ def _bar_colour(pct: float) -> str:
     if pct >= 80:
         return _STATS_RED
     if pct >= 60:
+        return _STATS_YELLOW
+    return _STATS_GREEN
+
+
+def _free_colour(free_pct: float) -> str:
+    """Return the Rich colour name for a volume's free-space percentage.
+
+    Thresholds are based on how much space is FREE (not used):
+    - free < 10%  → red   (critically low)
+    - free < 25%  → yellow (getting low)
+    - else        → green  (plenty of space)
+    """
+    if free_pct < _VOLUME_RED_THRESHOLD:
+        return _STATS_RED
+    if free_pct < _VOLUME_YELLOW_THRESHOLD:
         return _STATS_YELLOW
     return _STATS_GREEN
 
@@ -71,7 +93,7 @@ def _fmt_rate(bps: float) -> str:
     return s.ljust(7)
 
 
-def render_status_bar(snapshot: SystemStatsSnapshot) -> Text:
+def render_status_bar(snapshot: SystemStatsSnapshot, *, volume_index: int = 0) -> Text:
     """Render the one-line system-stats bar with fixed-width numeric columns.
 
     CPU %, RAM %, and free-RAM are rendered in fixed-width slots so the
@@ -119,6 +141,15 @@ def render_status_bar(snapshot: SystemStatsSnapshot) -> Text:
         f"Net ↓{_fmt_rate(snapshot.net_down_bps)}" f" ↑{_fmt_rate(snapshot.net_up_bps)}"
     )
 
+    if snapshot.volumes:
+        vol = snapshot.volumes[volume_index % len(snapshot.volumes)]
+        out.append(" │ ", style="dim")
+        out.append("↻ ")
+        out.append(
+            f"{vol.mountpoint} {int(vol.free_pct)}% free",
+            style=_free_colour(vol.free_pct),
+        )
+
     return out
 
 
@@ -138,5 +169,11 @@ class Monitor:
         self._model = SystemStatsModel()
 
     def tick(self, now: float) -> Text:
-        """Sample system stats and return the rendered status-bar line."""
-        return render_status_bar(self._model.tick(now))
+        """Sample system stats and return the rendered status-bar line.
+
+        ``volume_index = int(now / _VOLUME_ROTATE_SECONDS)`` advances the
+        displayed mount every ``_VOLUME_ROTATE_SECONDS`` seconds of wall-clock
+        time (the monotonic float passed by MonitorRegistry).
+        """
+        volume_index = int(now / _VOLUME_ROTATE_SECONDS)
+        return render_status_bar(self._model.tick(now), volume_index=volume_index)

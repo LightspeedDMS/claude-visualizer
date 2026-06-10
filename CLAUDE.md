@@ -85,10 +85,35 @@ Routing is by event type: `FileModifiedEvent` → MRU + diff queue; `CommandEven
   documentation only. `monitors/zzz_machine_stats.py` is the RELOCATED home of
   the system-resource bar (CPU/RAM/Disk/Net) that was previously rendered by
   `ui/panels.py`; it exposes a `Monitor` class whose `tick(now)` returns the
-  same `render_status_bar(snapshot)` `Text` as before, so all 12
-  `test_system_stats.py` and 13 `TestRenderStatusBar`/`TestFmtRate` tests are
-  unchanged — only the import path shifts. The `zzz_` prefix ensures this
-  bundled monitor sorts last so user monitors appear above it in the bar (AC1).
+  `render_status_bar(snapshot, volume_index=…)` `Text`. The `zzz_` prefix
+  ensures this bundled monitor sorts last so user monitors appear above it in
+  the bar (AC1). **Rotating volume free-space segment** (additive, appended
+  after Net): `… │ ↻ <mountpoint> N% free` color-coded by free space (red
+  `< 10%`, yellow `< 25%`, green `≥ 25%`). `Monitor.tick(now)` computes
+  `volume_index = int(now / _VOLUME_ROTATE_SECONDS)` (module constant,
+  `_VOLUME_ROTATE_SECONDS = 10.0`) and passes it to `render_status_bar` as a
+  keyword-only arg (`volume_index: int = 0`, default keeps all existing
+  call-sites and tests valid); the segment is OMITTED when
+  `snapshot.volumes` is empty (backward-compat). Volume data lives in
+  `SystemStatsSnapshot.volumes: tuple[VolumeUsage, ...] = ()` (default `()`
+  keeps all existing snapshot constructors valid). `SystemStatsModel.tick()`
+  enumerates `psutil.disk_partitions(all=False)` and uses the pure helper
+  `_should_include_mount(mountpoint, fstype)` as the single inclusion decision.
+  `_FILTERED_FSTYPES` covers pseudo/transient types (tmpfs, squashfs, overlay,
+  devtmpfs, cgroup*, etc.) **plus network and FUSE remote types** (nfs, nfs4,
+  cifs, smbfs, smb3, fuse.sshfs, fuse.s3fs, fuse.gvfsd-fuse, fuse.portal,
+  gvfs, fuse.rclone) — these are excluded to prevent `statvfs` blocking
+  indefinitely on hung remote mounts. `_FILTERED_MOUNT_PREFIXES` covers
+  `/proc`, `/sys`, `/dev`, `/run`, `/snap`; however `/run/media/...` USB
+  automounts are **explicitly allowed** (the exception is checked before the
+  prefix filter, so plugged-in USB drives appear in the volume rotator).
+  Each `psutil.disk_usage` call is wrapped in
+  `try/except (PermissionError, OSError, FileNotFoundError)` (MESSI #13 —
+  one bad mount never aborts the enumeration); results sorted by mountpoint for
+  stable ordering. Volume sampling is **throttled** to at most once every 5 s
+  (`_VOLUME_SAMPLE_INTERVAL = 5.0`): `_last_vol_sample` starts at
+  `-_VOLUME_SAMPLE_INTERVAL` so the first tick samples immediately; subsequent
+  ticks reuse `_cached_volumes` until 5 s have elapsed.
   `monitors/proxmox_cluster.py` (story #7) is a **drop-in Monitor plugin** —
   zero edits to core modules. `Monitor.__init__` reads
   `~/.claude-visualizer/proxmox.yaml` (PyYAML) into a `ProxmoxConfig`
@@ -129,8 +154,18 @@ Routing is by event type: `FileModifiedEvent` → MRU + diff queue; `CommandEven
   `health.checks` codes to CRIT/WARN/INFO (unknown codes → WARN verbatim),
   adds node-offline/CPU/RAM/HA alerts, and stable-sorts CRIT→WARN→INFO.
   The current alert rotates every `alert_rotate_seconds` (ring-buffer index).
-  Renderer layout: `Cluster: OK/WARN/ERR │ Ceph: <status> │ <name>● per node
-  │ ● per OSD (id asc) osds │ ↻ ⚑ <alert>` or `↻ no alerts`.
+  Renderer layout: `Cluster: OK/WARN/ERR │ Ceph: <status>[ · NN% free] │
+  <name>● per node │ ● per OSD (id asc) osds │ ↻ ⚑ <alert>` or `↻ no alerts`.
+  The `· NN% free` token (free = `(1 - ceph_used_pct)·100`, ` · ` separator
+  `dim`, colour by FREE space via `_colour_for_ceph_free_pct`: red `<10`,
+  yellow `<25`, else green) is appended after the Ceph status ONLY when
+  `snapshot.ceph_total_bytes > 0`. `ceph_total_bytes: float = 0.0` (default 0 =
+  unknown, i.e. no pgmap data) is the **anti-fabrication guard**: `_parse` reads
+  pgmap `bytes_total` defaulting to `0` (NOT `1`) and computes `ceph_used_pct =
+  bytes_used/bytes_total if total>0 else 0.0`, so a cluster with no capacity
+  data renders `Ceph: <status>` with NO fabricated free %. The `1→0` default
+  change also makes `build_alerts` safer (a no-data cluster can no longer emit a
+  spurious `Ceph 100% full` capacity alert).
   Dependencies: `requests>=2.31` (HTTP), `pyyaml>=6` (config).
   `monitors/proxmox_perf.py` is a SECOND drop-in Proxmox monitor — a cluster-wide
   **performance** line. Filename sorts AFTER `proxmox_cluster.py` and before
