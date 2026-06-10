@@ -39,6 +39,7 @@ from claude_visualizer.ui.panels import (
     DiffPanel,
     MonitorBar,
     MruFilesPanel,
+    clamp_viewport_to_cursor,
     format_command_row,
     format_mru_row,
     render_commands,
@@ -47,6 +48,7 @@ from claude_visualizer.ui.panels import (
     render_mru,
     scroll_command,
     truncate_command,
+    viewport_offset_for_cursor,
 )
 
 
@@ -2462,7 +2464,14 @@ class TestFocusablePanels:
             )
 
     async def test_mru_down_key_increases_scroll_offset(self, tmp_path: Path):
-        """↓ on focused MRU panel increases _scroll_offset."""
+        """↓ on focused MRU panel moves the cursor (_selected_index) down by 1.
+
+        Under the smart-cursor model, ↓ moves _selected_index (the logical
+        cursor), not _scroll_offset.  _scroll_offset only changes when the
+        cursor leaves the visible viewport.  This test seeds more rows than a
+        screenful so PageDown can also be verified, but the key assertion is
+        that _selected_index increases by exactly 1 per ↓ press.
+        """
         root = tmp_path / "projects"
         session = root / "proj" / "mru_scroll.jsonl"
         cfg = _fixture_config(root)
@@ -2484,16 +2493,22 @@ class TestFocusablePanels:
             mru = pilot.app.query_one(MruFilesPanel)
             mru.focus()
             await pilot.pause()
-            before = mru._scroll_offset
+            before = mru._selected_index
             await pilot.press("down")
             await pilot.pause()
-            assert mru._scroll_offset > before, (
-                f"↓ on focused MRU must increase _scroll_offset; "
-                f"before={before}, after={mru._scroll_offset}"
+            assert mru._selected_index > before, (
+                f"↓ on focused MRU must increase _selected_index; "
+                f"before={before}, after={mru._selected_index}"
             )
 
     async def test_mru_up_key_decreases_scroll_offset_floor_zero(self, tmp_path: Path):
-        """↑ on focused MRU panel decreases _scroll_offset, floored at 0."""
+        """↑ on focused MRU panel decreases _selected_index, floored at 0.
+
+        Under the smart-cursor model, ↑ moves _selected_index (the logical
+        cursor).  _scroll_offset only changes when the cursor would leave the
+        viewport.  We verify: two ↓ moves _selected_index to 2; one ↑ brings
+        it back; at 0 it stays at 0.
+        """
         root = tmp_path / "projects"
         session = root / "proj" / "mru_up.jsonl"
         cfg = _fixture_config(root)
@@ -2513,25 +2528,25 @@ class TestFocusablePanels:
 
             mru = pilot.app.query_one(MruFilesPanel)
             mru.focus()
-            # Scroll down first so there is room to scroll up.
+            # Move cursor down twice so there is room to move up.
             await pilot.press("down")
             await pilot.press("down")
             await pilot.pause()
-            assert mru._scroll_offset >= 2
+            assert mru._selected_index >= 2
 
-            # Now scroll up — offset should decrease.
+            # Now move cursor up — _selected_index should decrease.
             await pilot.press("up")
             await pilot.pause()
-            assert mru._scroll_offset < 2, (
-                f"↑ on focused MRU must decrease _scroll_offset; "
-                f"after two down + one up, got {mru._scroll_offset}"
+            assert mru._selected_index < 2, (
+                f"↑ on focused MRU must decrease _selected_index; "
+                f"after two down + one up, got {mru._selected_index}"
             )
 
-            # At offset 0, ↑ does not go negative.
-            mru._scroll_offset = 0
+            # At cursor=0, ↑ does not go negative.
+            mru._selected_index = 0
             await pilot.press("up")
             await pilot.pause()
-            assert mru._scroll_offset == 0, "↑ at offset 0 must stay at 0"
+            assert mru._selected_index == 0, "↑ at cursor 0 must stay at 0"
 
     async def test_diff_down_key_only_scrolls_when_pinned(self, tmp_path: Path):
         """↓ on focused Diff panel does nothing when unpinned; scrolls when pinned."""
@@ -2956,7 +2971,12 @@ class TestPageScrollKeys:
     """
 
     async def test_mru_pagedown_jumps_more_than_one_row(self, tmp_path: Path):
-        """PageDown on focused MRU jumps _scroll_offset by more than 1 row."""
+        """PageDown on focused MRU jumps _selected_index by more than 1 row.
+
+        Under the smart-cursor model, both ↓ and PageDown move _selected_index.
+        A single ↓ moves the cursor by 1; PageDown moves it by a full page
+        (_page_step() rows).  We verify the page jump is larger than 1.
+        """
         root = tmp_path / "projects"
         session = root / "proj" / "mru_page.jsonl"
         cfg = _fixture_config(root)
@@ -2979,24 +2999,29 @@ class TestPageScrollKeys:
             mru.focus()
             await pilot.pause()
 
-            # One single ↓ step.
-            before_down = mru._scroll_offset
+            # One single ↓ step — cursor moves by 1.
+            before_down = mru._selected_index
             await pilot.press("down")
             await pilot.pause()
-            single_step = mru._scroll_offset - before_down
+            single_step = mru._selected_index - before_down
             assert single_step == 1, f"Expected single step=1, got {single_step}"
 
-            # Reset to 0 then measure pagedown jump.
-            mru._scroll_offset = 0
+            # Reset cursor to 0 then measure pagedown jump.
+            mru._selected_index = 0
             await pilot.press("pagedown")
             await pilot.pause()
-            page_jump = mru._scroll_offset
+            page_jump = mru._selected_index
             assert (
                 page_jump > 1
-            ), f"pagedown must jump by more than 1 row; got _scroll_offset={page_jump}"
+            ), f"pagedown must jump cursor by more than 1 row; got _selected_index={page_jump}"
 
     async def test_mru_pageup_returns_toward_zero(self, tmp_path: Path):
-        """PageUp on focused MRU decreases _scroll_offset, floored at 0."""
+        """PageUp on focused MRU decreases _selected_index, floored at 0.
+
+        Under the smart-cursor model, PageDown/PageUp move _selected_index by a
+        full page.  We verify: PageDown advances cursor; PageUp brings it back;
+        at cursor=0 PageUp stays at 0.
+        """
         root = tmp_path / "projects"
         session = root / "proj" / "mru_pageup.jsonl"
         cfg = _fixture_config(root)
@@ -3021,23 +3046,23 @@ class TestPageScrollKeys:
             # Page down first so there is room to page up.
             await pilot.press("pagedown")
             await pilot.pause()
-            after_down = mru._scroll_offset
-            assert after_down > 0, "pagedown must advance from 0"
+            after_down = mru._selected_index
+            assert after_down > 0, "pagedown must advance cursor from 0"
 
-            # PageUp must bring offset back toward 0.
+            # PageUp must bring cursor back toward 0.
             await pilot.press("pageup")
             await pilot.pause()
-            after_up = mru._scroll_offset
+            after_up = mru._selected_index
             assert after_up < after_down, (
-                f"pageup must decrease _scroll_offset; after_down={after_down}, "
+                f"pageup must decrease _selected_index; after_down={after_down}, "
                 f"after_up={after_up}"
             )
 
-            # PageUp at 0 must not go negative.
-            mru._scroll_offset = 0
+            # PageUp at cursor=0 must not go negative.
+            mru._selected_index = 0
             await pilot.press("pageup")
             await pilot.pause()
-            assert mru._scroll_offset == 0, "pageup at offset 0 must stay at 0"
+            assert mru._selected_index == 0, "pageup at cursor 0 must stay at 0"
 
     async def test_commands_pagedown_jumps_more_than_one_row(self, tmp_path: Path):
         """PageDown on focused Commands panel jumps _scroll_offset by more than 1."""
@@ -3253,43 +3278,43 @@ def _key_event(key: str):
 
 
 class TestMruKeyboardSelect:
-    """↑/↓ keys on MruFilesPanel post FileClicked for the row at _scroll_offset."""
+    """↑/↓ keys on MruFilesPanel post FileClicked for the row at _selected_index."""
 
     def test_down_key_posts_file_clicked_with_correct_path(self):
-        """↓ scrolls by 1 and posts FileClicked for the new _scroll_offset row."""
+        """↓ moves _selected_index by 1 and posts FileClicked for that cursor row."""
         panel, model = _make_mru_panel("kbsel", 4)
-        assert panel._scroll_offset == 0
+        assert panel._selected_index == 0
 
         panel.on_key(_key_event("down"))
 
-        assert panel._scroll_offset == 1
+        assert panel._selected_index == 1
         assert len(panel.posted) == 1
         msg = panel.posted[0]
         assert isinstance(msg, MruFilesPanel.FileClicked)
         assert msg.event_key == panel._rows[1].event_key
 
     def test_up_key_from_non_zero_offset_posts_file_clicked(self):
-        """↑ decrements offset and posts FileClicked for the row now at offset."""
+        """↑ decrements _selected_index and posts FileClicked for the cursor row."""
         panel, model = _make_mru_panel("kbsel", 4)
-        panel._scroll_mru(2)  # advance to offset 2
+        panel._selected_index = 2  # place cursor at row 2
         panel.posted.clear()
 
         panel.on_key(_key_event("up"))
 
-        assert panel._scroll_offset == 1
+        assert panel._selected_index == 1
         assert len(panel.posted) == 1
         msg = panel.posted[0]
         assert isinstance(msg, MruFilesPanel.FileClicked)
         assert msg.event_key == panel._rows[1].event_key
 
     def test_up_key_at_offset_zero_posts_file_clicked_for_row_zero(self):
-        """↑ at offset 0 stays at 0 and posts FileClicked for rows()[0]."""
+        """↑ at cursor=0 stays at 0 and posts FileClicked for rows()[0]."""
         panel, model = _make_mru_panel("kbsel", 4)
-        assert panel._scroll_offset == 0
+        assert panel._selected_index == 0
 
         panel.on_key(_key_event("up"))
 
-        assert panel._scroll_offset == 0
+        assert panel._selected_index == 0
         assert len(panel.posted) == 1
         assert panel.posted[0].event_key == panel._rows[0].event_key
 
@@ -3301,24 +3326,23 @@ class TestMruKeyboardSelect:
 
 
 class TestMruKeyboardSelectPageDown:
-    """PageDown/PageUp keys post FileClicked for the row at _scroll_offset."""
+    """PageDown/PageUp keys post FileClicked for the row at _selected_index."""
 
     def test_pagedown_posts_file_clicked_at_new_offset(self):
-        """PageDown scrolls by _page_step() and posts FileClicked."""
+        """PageDown moves _selected_index by _page_step() and posts FileClicked."""
         panel, model = _make_mru_panel("pgsel", 10)
-        # Force a known page step by placing enough rows and using a non-zero step.
-        # We rely on _scroll_mru's clamping so the offset after pagedown is valid.
+        # Enough rows so PageDown has room to jump.
         panel.on_key(_key_event("pagedown"))
 
         assert len(panel.posted) == 1
         msg = panel.posted[0]
         assert isinstance(msg, MruFilesPanel.FileClicked)
-        assert msg.event_key == panel._rows[panel._scroll_offset].event_key
+        assert msg.event_key == panel._rows[panel._selected_index].event_key
 
     def test_pageup_posts_file_clicked_at_new_offset(self):
-        """PageUp scrolls back and posts FileClicked for the row at new offset."""
+        """PageUp moves _selected_index back and posts FileClicked for the cursor row."""
         panel, model = _make_mru_panel("pgsel", 10)
-        panel._scroll_mru(5)  # start in the middle
+        panel._selected_index = 5  # place cursor in the middle
         panel.posted.clear()
 
         panel.on_key(_key_event("pageup"))
@@ -3326,25 +3350,28 @@ class TestMruKeyboardSelectPageDown:
         assert len(panel.posted) == 1
         msg = panel.posted[0]
         assert isinstance(msg, MruFilesPanel.FileClicked)
-        assert msg.event_key == panel._rows[panel._scroll_offset].event_key
+        assert msg.event_key == panel._rows[panel._selected_index].event_key
 
 
 class TestMruMouseWheelNoSelect:
-    """Mouse wheel scroll on MruFilesPanel must NOT post FileClicked (scroll-only)."""
+    """Mouse wheel scroll on MruFilesPanel must NOT post FileClicked or move _selected_index."""
 
     def test_mouse_scroll_down_does_not_post_file_clicked(self):
-        """on_mouse_scroll_down scrolls offset but must NOT post FileClicked."""
+        """on_mouse_scroll_down pans viewport but must NOT post FileClicked or move cursor."""
         panel, model = _make_mru_panel("wheel", 6)
+        assert panel._selected_index == 0
         panel.on_mouse_scroll_down(None)
         assert (
             panel.posted == []
         ), f"Wheel down must not post FileClicked; got {panel.posted}"
         assert panel._scroll_offset == 1, "Wheel down must still scroll offset"
+        assert panel._selected_index == 0, "Wheel down must NOT move _selected_index"
 
     def test_mouse_scroll_up_does_not_post_file_clicked(self):
-        """on_mouse_scroll_up scrolls offset but must NOT post FileClicked."""
+        """on_mouse_scroll_up pans viewport but must NOT post FileClicked or move cursor."""
         panel, model = _make_mru_panel("wheel", 6)
         panel._scroll_mru(3)
+        panel._selected_index = 2  # cursor stays at 2, only viewport panned
         panel.posted.clear()
 
         panel.on_mouse_scroll_up(None)
@@ -3353,6 +3380,7 @@ class TestMruMouseWheelNoSelect:
             panel.posted == []
         ), f"Wheel up must not post FileClicked; got {panel.posted}"
         assert panel._scroll_offset == 2, "Wheel up must still scroll offset"
+        assert panel._selected_index == 2, "Wheel up must NOT move _selected_index"
 
 
 class TestTitleHighlightIntegration:
@@ -3413,7 +3441,7 @@ class TestHomeEndKeys:
     """
 
     async def test_mru_home_scrolls_to_top(self, tmp_path: Path):
-        """Home on focused MRU resets _scroll_offset to 0."""
+        """Home on focused MRU moves _selected_index to 0 and resets _scroll_offset to 0."""
         root = tmp_path / "projects"
         session = root / "proj" / "mru_home.jsonl"
         cfg = _fixture_config(root)
@@ -3435,16 +3463,28 @@ class TestHomeEndKeys:
             mru.focus()
             await pilot.pause()
 
-            # Scroll down first so offset > 0.
+            # Place cursor and viewport away from top first.
+            mru._selected_index = 15
             mru._scroll_offset = 15
             await pilot.press("home")
             await pilot.pause()
+            assert (
+                mru._selected_index == 0
+            ), f"home must reset _selected_index to 0; got {mru._selected_index}"
             assert (
                 mru._scroll_offset == 0
             ), f"home must reset _scroll_offset to 0; got {mru._scroll_offset}"
 
     async def test_mru_end_scrolls_to_bottom(self, tmp_path: Path):
-        """End on focused MRU sets _scroll_offset to len(rows) - 1."""
+        """End on focused MRU moves _selected_index to len(rows)-1.
+
+        Under the smart-cursor model, End sets _selected_index (the logical
+        cursor) to the last row.  _scroll_offset is adjusted by
+        clamp_viewport_to_cursor so the last row is visible — it will be
+        len(rows) - visible_rows (not len(rows)-1, which would be the OLD
+        all-rows-scrolled-away behavior).  We verify _selected_index is at
+        the last row and _scroll_offset <= _selected_index.
+        """
         root = tmp_path / "projects"
         session = root / "proj" / "mru_end.jsonl"
         cfg = _fixture_config(root)
@@ -3466,14 +3506,20 @@ class TestHomeEndKeys:
             mru.focus()
             await pilot.pause()
 
-            # Ensure offset starts at 0.
+            # Start cursor at 0.
+            mru._selected_index = 0
             mru._scroll_offset = 0
             await pilot.press("end")
             await pilot.pause()
-            expected_max = len(mru._rows) - 1
-            assert mru._scroll_offset == expected_max, (
-                f"end must set _scroll_offset to {expected_max}; "
-                f"got {mru._scroll_offset}"
+            expected_last = len(mru._rows) - 1
+            assert mru._selected_index == expected_last, (
+                f"end must set _selected_index to {expected_last}; "
+                f"got {mru._selected_index}"
+            )
+            # Viewport must be adjusted so the cursor row is visible.
+            assert mru._scroll_offset <= mru._selected_index, (
+                f"_scroll_offset ({mru._scroll_offset}) must be <= "
+                f"_selected_index ({mru._selected_index}) after End"
             )
 
     async def test_commands_home_scrolls_to_top(self, tmp_path: Path):
@@ -3679,4 +3725,464 @@ class TestHomeEndKeys:
             assert app._diff_queue._pin_scroll > 0, (
                 f"end on PINNED diff must advance _pin_scroll beyond 0; "
                 f"got {app._diff_queue._pin_scroll}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Smart cursor: clamp_viewport_to_cursor pure function + MruFilesPanel widget
+# ---------------------------------------------------------------------------
+
+
+class TestClampViewportToCursor:
+    """Pure unit tests for the clamp_viewport_to_cursor helper.
+
+    All values are explicit — no Textual runtime, no panel mounting needed.
+    """
+
+    def test_cursor_inside_window_offset_unchanged(self):
+        """Cursor within [offset, offset+visible-1] → offset is unchanged."""
+        # cursor=2, offset=0, visible=5, total=10  → cursor is visible → 0
+        assert clamp_viewport_to_cursor(2, 0, 5, 10) == 0
+
+    def test_cursor_at_bottom_of_window_offset_unchanged(self):
+        """Cursor at exactly offset + visible - 1 → offset is unchanged."""
+        # cursor=4, offset=0, visible=5, total=10  → exactly at bottom → 0
+        assert clamp_viewport_to_cursor(4, 0, 5, 10) == 0
+
+    def test_cursor_one_below_window_offset_increments(self):
+        """Cursor one row below the visible window → offset moves down by 1."""
+        # cursor=5, offset=0, visible=5, total=10  → cursor=offset+visible → 1
+        assert clamp_viewport_to_cursor(5, 0, 5, 10) == 1
+
+    def test_cursor_far_below_window_offset_jumps(self):
+        """Cursor several rows below → offset = cursor - visible + 1."""
+        # cursor=8, offset=0, visible=5, total=10  → 8 - 5 + 1 = 4
+        assert clamp_viewport_to_cursor(8, 0, 5, 10) == 4
+
+    def test_cursor_above_offset_scrolls_up(self):
+        """Cursor above the viewport → offset = cursor."""
+        # cursor=2, offset=5, visible=5, total=15  → offset moves to 2
+        assert clamp_viewport_to_cursor(2, 5, 5, 15) == 2
+
+    def test_cursor_at_offset_boundary_unchanged(self):
+        """Cursor exactly at offset → still visible → offset unchanged."""
+        # cursor=5, offset=5, visible=5, total=15  → first visible row → 5
+        assert clamp_viewport_to_cursor(5, 5, 5, 15) == 5
+
+    def test_offset_clamped_at_zero(self):
+        """Result is never negative."""
+        # cursor=0, offset=0, visible=5, total=10  → already at top → 0
+        assert clamp_viewport_to_cursor(0, 0, 5, 10) == 0
+
+    def test_offset_clamped_when_total_less_than_visible(self):
+        """Total smaller than visible rows → offset must stay 0."""
+        # cursor=2, offset=0, visible=10, total=3  → all rows visible → 0
+        assert clamp_viewport_to_cursor(2, 0, 10, 3) == 0
+
+    def test_visible_rows_1_cursor_at_different_positions(self):
+        """With visible_rows=1 every cursor position sets offset=cursor."""
+        assert clamp_viewport_to_cursor(0, 0, 1, 5) == 0
+        assert clamp_viewport_to_cursor(3, 0, 1, 5) == 3
+        assert clamp_viewport_to_cursor(4, 0, 1, 5) == 4
+
+    def test_cursor_at_last_row_offset_clamped(self):
+        """Cursor at last row → offset = total - visible (clamped at 0)."""
+        # cursor=9, offset=0, visible=5, total=10  → 9 - 5 + 1 = 5
+        assert clamp_viewport_to_cursor(9, 0, 5, 10) == 5
+
+    def test_single_row_total(self):
+        """Single-row list → cursor=0, offset always 0."""
+        assert clamp_viewport_to_cursor(0, 0, 5, 1) == 0
+
+
+class TestViewportOffsetForCursor:
+    """Pure unit tests for viewport_offset_for_cursor (wrap-aware viewport helper).
+
+    ``viewport_offset_for_cursor`` is the wrap-aware counterpart to
+    ``clamp_viewport_to_cursor``.  It takes a ``line_counts`` list (one integer
+    per MRU row, each ≥ 1) that maps logical rows to physical display lines, and
+    computes the scroll_offset that keeps the selected row visible in a viewport
+    of ``visible_rows`` physical lines.
+
+    All tests are pure arithmetic — no Textual runtime required.
+    """
+
+    def test_single_line_rows_behave_like_clamp_viewport(self):
+        """When all rows are 1 physical line, result matches clamp_viewport_to_cursor."""
+        # cursor=5, offset=0, visible=5, total=10 → clamp gives 1
+        line_counts = [1] * 10
+        result = viewport_offset_for_cursor(5, 0, 5, 10, line_counts=line_counts)
+        assert result == 1
+
+    def test_cursor_inside_visible_window_offset_unchanged(self):
+        """Cursor row already visible → offset unchanged."""
+        # 3 rows each 1 line → visible window [0,1,2], visible_rows=5 → all fit
+        line_counts = [1, 1, 1]
+        result = viewport_offset_for_cursor(1, 0, 5, 3, line_counts=line_counts)
+        assert result == 0
+
+    def test_wrapped_row_above_pushes_offset_by_extra_lines(self):
+        """A 3-line wrapped row above the cursor counts as 3 physical lines.
+
+        Setup: 4 rows, row 0 wraps to 3 physical lines, rows 1-3 are 1 line each.
+        visible_rows=5, cursor=1.  After the 3-line row 0, there is 1 line of row 1
+        still fitting in the 5-line window → cursor is visible at offset=0.
+        """
+        line_counts = [3, 1, 1, 1]
+        # cursor=1 (row 1) starts at physical line 3 → still within visible_rows=5
+        result = viewport_offset_for_cursor(1, 0, 5, 4, line_counts=line_counts)
+        assert result == 0
+
+    def test_wrapped_row_forces_offset_advance(self):
+        """Cursor below the visible window when preceding row wraps.
+
+        Setup: 4 rows, row 0 wraps to 4 lines, rows 1-3 are 1 line each.
+        visible_rows=4, cursor=1.  Row 0 alone fills the 4-line window →
+        row 1 is NOT visible → offset must advance to 1.
+        """
+        line_counts = [4, 1, 1, 1]
+        result = viewport_offset_for_cursor(1, 0, 4, 4, line_counts=line_counts)
+        assert result == 1
+
+    def test_cursor_row_wraps_itself_still_visible_if_fits(self):
+        """If the cursor row itself wraps but still starts within visible_rows, offset=0."""
+        # row 0: 1 line, row 1: 2 lines → at offset=0 rows [0,1] occupy 3 lines ≤ visible=5
+        line_counts = [1, 2, 1, 1]
+        result = viewport_offset_for_cursor(1, 0, 5, 4, line_counts=line_counts)
+        assert result == 0
+
+    def test_scrolled_past_cursor_above_snaps_offset_back(self):
+        """Cursor above the current offset → offset snaps to cursor row index."""
+        # All 1-line rows; cursor=2, offset=5 → cursor is above window → snap to 2
+        line_counts = [1] * 10
+        result = viewport_offset_for_cursor(2, 5, 5, 10, line_counts=line_counts)
+        assert result == 2
+
+    def test_missing_line_counts_falls_back_to_one_line_per_row(self):
+        """Empty/None line_counts → treats every row as 1 line (unmounted fallback)."""
+        result = viewport_offset_for_cursor(5, 0, 5, 10, line_counts=None)
+        # Behaves like clamp_viewport_to_cursor(5, 0, 5, 10) = 1
+        assert result == 1
+
+    def test_empty_line_counts_falls_back_to_one_line_per_row(self):
+        """Empty list line_counts → treats every row as 1 line."""
+        result = viewport_offset_for_cursor(5, 0, 5, 10, line_counts=[])
+        assert result == 1
+
+    def test_offset_never_negative(self):
+        """Result is always ≥ 0."""
+        line_counts = [1] * 5
+        result = viewport_offset_for_cursor(0, 3, 5, 5, line_counts=line_counts)
+        assert result >= 0
+
+    def test_all_wrap_three_lines_cursor_two(self):
+        """Four rows each wrapping to 3 lines; visible_rows=6.
+
+        Rows start at physical lines: row0=0, row1=3, row2=6, row3=9.
+        visible_rows=6: offset=0 shows physical lines 0-5 → row0 (0-2) + row1 (3-5) fit.
+        cursor=2 → starts at physical line 6 → NOT in window [0,5] → offset must advance.
+        advance: with offset=1, window starts at row1 physical line 3,
+        rows row1 (3-5) + row2 (6-8) fit in 6 lines → cursor=2 is visible → offset=1.
+        """
+        line_counts = [3, 3, 3, 3]
+        result = viewport_offset_for_cursor(2, 0, 6, 4, line_counts=line_counts)
+        assert result == 1
+
+
+class TestSmartCursorMruPanel:
+    """Widget-level tests for the new cursor/viewport split on MruFilesPanel.
+
+    Tests exercise _selected_index vs _scroll_offset independence.
+    Pure (no Textual runtime) — uses _SpyMruPanel for message capture and tests
+    clamp_viewport_to_cursor as a pure function with explicit visible_rows.
+    """
+
+    def _make_panel(self, count: int) -> tuple:
+        """Return (_SpyMruPanel, MruModel) with ``count`` entries."""
+        return _make_mru_panel("sc", count)
+
+    # --- cursor moves without touching viewport (short list) -----------------
+
+    def test_down_moves_selected_index_not_scroll_offset_when_fits(self):
+        """↓ on a short list moves _selected_index from 0 to 1.
+
+        _scroll_offset behaviour is viewport-dependent (pre-layout panels have
+        visible_rows=1 so the offset may advance); the invariant under test is
+        that _selected_index moves correctly, not that the viewport stays still.
+        The mounted-panel follow behaviour is covered by
+        TestWrapAwareViewportFollow.
+        """
+        panel, model = self._make_panel(3)
+        assert panel._selected_index == 0
+
+        panel.on_key(_key_event("down"))
+
+        # The core invariant: _selected_index advanced by 1.
+        assert panel._selected_index == 1
+
+    def test_up_from_zero_keeps_selected_index_at_zero(self):
+        """↑ at cursor=0 keeps _selected_index at 0 (floor)."""
+        panel, model = self._make_panel(4)
+        assert panel._selected_index == 0
+
+        panel.on_key(_key_event("up"))
+
+        assert panel._selected_index == 0
+
+    def test_down_clamps_at_last_row(self):
+        """↓ never moves _selected_index past len(rows)-1."""
+        panel, model = self._make_panel(3)
+        for _ in range(10):
+            panel.on_key(_key_event("down"))
+        assert panel._selected_index == 2
+
+    def test_home_sets_selected_index_to_zero(self):
+        """Home → _selected_index = 0."""
+        panel, model = self._make_panel(5)
+        panel._selected_index = 3
+        panel.on_key(_key_event("home"))
+        assert panel._selected_index == 0
+
+    def test_end_sets_selected_index_to_last(self):
+        """End → _selected_index = len(rows) - 1."""
+        panel, model = self._make_panel(5)
+        panel.on_key(_key_event("end"))
+        assert panel._selected_index == 4
+
+    # --- FileClicked targets _selected_index, NOT _scroll_offset ------------
+
+    def test_down_posts_file_clicked_for_selected_index(self):
+        """↓ posts FileClicked(rows[_selected_index].event_key), not rows[0]."""
+        panel, model = self._make_panel(4)
+
+        panel.on_key(_key_event("down"))
+
+        assert len(panel.posted) == 1
+        msg = panel.posted[0]
+        assert isinstance(msg, MruFilesPanel.FileClicked)
+        assert msg.event_key == panel._rows[panel._selected_index].event_key
+
+    def test_up_posts_file_clicked_for_selected_index(self):
+        """↑ posts FileClicked(rows[_selected_index].event_key)."""
+        panel, model = self._make_panel(4)
+        panel._selected_index = 2
+        panel.posted.clear()
+
+        panel.on_key(_key_event("up"))
+
+        assert len(panel.posted) == 1
+        msg = panel.posted[0]
+        assert msg.event_key == panel._rows[panel._selected_index].event_key
+
+    def test_home_posts_file_clicked_for_row_zero(self):
+        """Home posts FileClicked(rows[0].event_key)."""
+        panel, model = self._make_panel(5)
+        panel._selected_index = 3
+        panel.posted.clear()
+
+        panel.on_key(_key_event("home"))
+
+        assert len(panel.posted) == 1
+        assert panel.posted[0].event_key == panel._rows[0].event_key
+
+    def test_end_posts_file_clicked_for_last_row(self):
+        """End posts FileClicked(rows[-1].event_key)."""
+        panel, model = self._make_panel(5)
+        panel.posted.clear()
+
+        panel.on_key(_key_event("end"))
+
+        assert len(panel.posted) == 1
+        assert panel.posted[0].event_key == panel._rows[4].event_key
+
+    # --- viewport follows cursor (pure-function tests for clamping math) -----
+
+    def test_clamp_viewport_cursor_inside_no_scroll(self):
+        """cursor=2 inside [0,4] window → offset stays 0."""
+        result = clamp_viewport_to_cursor(
+            selected=2, scroll_offset=0, visible_rows=5, total=10
+        )
+        assert result == 0
+
+    def test_clamp_viewport_cursor_pushes_offset_down(self):
+        """cursor=5 with visible=5 starting at 0 → offset must become 1."""
+        result = clamp_viewport_to_cursor(
+            selected=5, scroll_offset=0, visible_rows=5, total=10
+        )
+        assert result == 1
+
+    def test_clamp_viewport_cursor_above_window_scrolls_up(self):
+        """cursor=1, offset=3 → offset snaps to cursor (1)."""
+        result = clamp_viewport_to_cursor(
+            selected=1, scroll_offset=3, visible_rows=5, total=10
+        )
+        assert result == 1
+
+    # --- wheel moves only _scroll_offset, NOT _selected_index ---------------
+
+    def test_wheel_down_moves_scroll_offset_not_selected_index(self):
+        """on_mouse_scroll_down moves _scroll_offset, leaves _selected_index alone."""
+        panel, model = self._make_panel(6)
+        panel._selected_index = 0
+        assert panel._scroll_offset == 0
+
+        panel.on_mouse_scroll_down(None)
+
+        assert panel._scroll_offset == 1
+        assert panel._selected_index == 0  # cursor untouched by wheel
+        assert panel.posted == []  # no FileClicked from wheel
+
+    def test_wheel_up_moves_scroll_offset_not_selected_index(self):
+        """on_mouse_scroll_up moves _scroll_offset, leaves _selected_index alone."""
+        panel, model = self._make_panel(6)
+        panel._selected_index = 3
+        # Manually set offset above 0 so wheel-up has room.
+        panel._scroll_offset = 3
+
+        panel.on_mouse_scroll_up(None)
+
+        assert panel._scroll_offset == 2
+        assert panel._selected_index == 3  # cursor untouched
+        assert panel.posted == []
+
+    # --- update_from_model clamps both indices on shrink ---------------------
+
+    def test_update_from_model_clamps_selected_index_on_shrink(self):
+        """When model shrinks, _selected_index is clamped to new len-1."""
+        panel, model = self._make_panel(10)
+        panel._selected_index = 8
+
+        # Replace with a 3-entry model.
+        small_model = MruModel(AppConfig(mru_max=50))
+        for i in range(3):
+            small_model.record(
+                _file_event(
+                    file_path=f"/repo/small_{i}.py",
+                    session_id=f"smsess{i:04d}",
+                    project_tag="proj",
+                )
+            )
+        panel.update_from_model(small_model)
+
+        assert panel._selected_index <= 2
+
+    def test_update_from_model_resets_both_to_zero_when_empty(self):
+        """Empty model → _selected_index=0, _scroll_offset=0."""
+        panel, model = self._make_panel(5)
+        panel._selected_index = 3
+        panel._scroll_offset = 2
+
+        empty_model = MruModel(AppConfig(mru_max=50))
+        panel.update_from_model(empty_model)
+
+        assert panel._selected_index == 0
+        assert panel._scroll_offset == 0
+
+
+# ---------------------------------------------------------------------------
+# Wrap-aware viewport follow — regression test (mounted, real app)
+# ---------------------------------------------------------------------------
+
+
+class TestWrapAwareViewportFollow:
+    """Regression: pressing ↓ past the visible window must advance _scroll_offset
+    AND keep the selected path visible in rendered_text().
+
+    With the old wrap-unaware _navigate_cursor (using _visible_rows() which
+    counts physical content height, not logical row height), pressing ↓ on a
+    list of wrapping entries would advance _selected_index but call
+    clamp_viewport_to_cursor with visible_rows=N based on raw content height
+    rather than the number of logical rows that fit.  This caused the viewport
+    to either not advance (cursor hidden below) or jump incorrectly.
+
+    The wrap-aware fix uses viewport_offset_for_cursor with per-row physical
+    line counts so the viewport tracks the cursor correctly even when rows wrap.
+    """
+
+    async def test_wrap_aware_viewport_follow_scrolls_offset(
+        self, tmp_path: Path
+    ) -> None:
+        """↓ past visible window: _scroll_offset > 0 AND selected path in rendered_text.
+
+        Seeds 8 MRU entries with long file paths that wrap at the narrow
+        terminal width (60 cols → MRU panel ~30 cols wide after splitter).
+        Presses ↓ enough times to push the cursor past the visible window,
+        then asserts:
+        - _scroll_offset > 0 (viewport advanced to follow cursor)
+        - the selected path is present in rendered_text() (cursor row visible)
+        """
+        root = tmp_path / "projects"
+        session = root / "proj" / "wrap_follow.jsonl"
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg)
+
+        # Use a narrow terminal so long paths wrap: width=60, height=20.
+        async with app.run_test(size=(60, 20)) as pilot:
+            # Seed 8 entries with paths long enough to wrap at ~20-30 col MRU width.
+            for i in range(8):
+                long_path = (
+                    f"/home/dev/very/long/project/path/module_{i:02d}/subdir/file.py"
+                )
+                _append_line(
+                    session,
+                    _write_tool_line(
+                        "Write",
+                        {"file_path": long_path, "content": "x"},
+                        session_id=f"wrapFOLLOW{i:04d}",
+                        cwd="/home/dev/very/long/project",
+                        timestamp=f"2024-01-15T10:00:0{i}.000Z",
+                    ),
+                )
+
+            # Wait for all 8 entries to arrive in the MRU panel.
+            await _pump(pilot, "module_00")
+
+            mru = pilot.app.query_one(MruFilesPanel)
+            mru.focus()
+            await pilot.pause()
+
+            # Verify we have enough rows to scroll.
+            assert len(mru._rows) >= 4, f"Expected ≥4 MRU rows; got {len(mru._rows)}"
+
+            content_width = mru.content_size.width
+            assert content_width > 0, "Panel not laid out — content_size.width=0"
+
+            # Verify at least one row wraps at this content width.
+            wrap_counts = []
+            for entry in mru._rows:
+                plain = format_mru_row(entry)
+                wc = max(1, (len(plain) + content_width - 1) // content_width)
+                wrap_counts.append(wc)
+
+            assert any(wc >= 2 for wc in wrap_counts), (
+                f"Expected at least one wrapping row at content_width={content_width}; "
+                f"wrap_counts={wrap_counts}"
+            )
+
+            # Press ↓ enough times to push the cursor past the visible window.
+            # The visible window at 20 rows minus chrome is ~18 physical lines.
+            # With wrapping rows each taking 2+ lines, ~5 presses should push past.
+            for _ in range(6):
+                await pilot.press("down")
+                await pilot.pause()
+
+            selected_idx = mru._selected_index
+            scroll_off = mru._scroll_offset
+
+            # Primary assertion: viewport advanced (cursor pushed past visible window).
+            assert scroll_off > 0, (
+                f"_scroll_offset must be > 0 after pressing ↓ past visible window "
+                f"with wrapping rows; got _scroll_offset={scroll_off}, "
+                f"_selected_index={selected_idx}, "
+                f"content_width={content_width}, wrap_counts={wrap_counts}"
+            )
+
+            # Secondary assertion: the selected path is still visible.
+            selected_path = mru._rows[selected_idx].file_path
+            rendered = mru.rendered_text()
+            assert selected_path in rendered, (
+                f"Selected path '{selected_path}' must be in rendered_text() "
+                f"after viewport-follow; _scroll_offset={scroll_off}, "
+                f"_selected_index={selected_idx}. "
+                f"rendered_text (first 400 chars): {rendered[:400]!r}"
             )

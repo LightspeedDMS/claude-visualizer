@@ -124,6 +124,141 @@ MISSING_TIME_TEXT = "--:--:--"
 TIME_FORMAT = "%H:%M:%S"
 
 
+def _wrapped_line_count(plain_text: str, width: int) -> int:
+    """Return the number of physical terminal lines occupied by ``plain_text`` at ``width``.
+
+    Uses integer ceiling division so a 1-char row at width=1 returns 1, not 0.
+    Always returns at least 1 so empty rows still occupy one physical line.
+
+    Pure — no Textual, no side effects.  Used by both :meth:`MruFilesPanel.on_mouse_down`
+    (click→row mapping) and :func:`viewport_offset_for_cursor` (cursor-follow).
+    """
+    if width <= 0:
+        return 1
+    return max(1, (len(plain_text) + width - 1) // width)
+
+
+def viewport_offset_for_cursor(
+    selected: int,
+    scroll_offset: int,
+    visible_rows: int,
+    total: int,
+    *,
+    line_counts: Optional[list],
+) -> int:
+    """Wrap-aware viewport offset that keeps ``selected`` visible in the viewport.
+
+    Like :func:`clamp_viewport_to_cursor` but accounts for MRU rows that wrap to
+    multiple physical terminal lines: ``line_counts[i]`` is the number of physical
+    lines row *i* occupies at the current panel width.  When a preceding row wraps
+    to 3 lines it occupies 3 slots in the visible window, leaving less room for
+    rows that follow.
+
+    Algorithm:
+    1. Walk rows from ``scroll_offset`` forward, accumulating physical lines.
+    2. If ``selected`` is reached before the accumulator exceeds ``visible_rows``
+       → cursor is already visible → return ``scroll_offset`` unchanged.
+    3. If we exhaust the window before reaching ``selected`` → cursor is below →
+       advance ``scroll_offset`` until the cursor fits.
+    4. If ``selected < scroll_offset`` → cursor is above → snap ``scroll_offset``
+       to ``selected``.
+
+    Fallback: if ``line_counts`` is ``None`` or empty every row is treated as 1
+    physical line, making this equivalent to :func:`clamp_viewport_to_cursor`.
+    Result is always clamped to ``[0, max(0, total - 1)]``.
+
+    Parameters
+    ----------
+    selected:
+        Logical row index of the cursor (0-based).
+    scroll_offset:
+        Current first-visible logical row index.
+    visible_rows:
+        Physical terminal lines available for the list body (after chrome).
+    total:
+        Total number of logical rows in the model.
+    line_counts:
+        Per-row physical line count list.  ``None`` or ``[]`` → 1 per row.
+    """
+    if not line_counts:
+        # Unmounted fallback: treat every row as 1 physical line.
+        return clamp_viewport_to_cursor(selected, scroll_offset, visible_rows, total)
+
+    visible_rows = max(1, visible_rows)
+
+    # Cursor above the viewport → snap offset to cursor row.
+    if selected < scroll_offset:
+        return max(0, selected)
+
+    # Check whether cursor is already visible within the current window.
+    accumulated = 0
+    for row_idx in range(scroll_offset, total):
+        wc = line_counts[row_idx] if row_idx < len(line_counts) else 1
+        if row_idx == selected:
+            # The cursor row starts at ``accumulated`` physical lines from the
+            # top of the viewport.  It is visible if that starting point is
+            # strictly less than visible_rows (there is at least one line for it).
+            if accumulated < visible_rows:
+                return scroll_offset  # cursor is visible — no change
+            break  # cursor starts beyond the window — need to scroll
+        accumulated += wc
+        if accumulated >= visible_rows:
+            # Window is full before we even reached the cursor.
+            break
+
+    # Cursor is not visible — advance scroll_offset one row at a time until it is.
+    new_offset = scroll_offset
+    while new_offset < selected:
+        new_offset += 1
+        # Check if cursor is now visible from new_offset.
+        accumulated = 0
+        for row_idx in range(new_offset, total):
+            wc = line_counts[row_idx] if row_idx < len(line_counts) else 1
+            if row_idx == selected:
+                if accumulated < visible_rows:
+                    return max(0, min(new_offset, max(0, total - 1)))
+                break
+            accumulated += wc
+            if accumulated >= visible_rows:
+                break
+
+    return max(0, min(new_offset, max(0, total - 1)))
+
+
+def clamp_viewport_to_cursor(
+    selected: int,
+    scroll_offset: int,
+    visible_rows: int,
+    total: int,
+) -> int:
+    """Return the new scroll_offset that keeps ``selected`` visible in the viewport.
+
+    Pure arithmetic helper — no Textual, no side effects.  Used by
+    :class:`MruFilesPanel` to implement standard listbox cursor-follow semantics:
+
+    - If ``selected`` is already within ``[scroll_offset, scroll_offset + visible_rows - 1]``
+      the offset is returned unchanged.
+    - If ``selected`` is above the window: ``offset = selected``.
+    - If ``selected`` is below the window: ``offset = selected - visible_rows + 1``.
+    - Result is always clamped to ``[0, max(0, total - visible_rows)]`` so the
+      viewport never shows a gap below the last row.
+
+    Parameters match the widget's state fields so callers can test the pure
+    arithmetic without mounting a Textual panel (where ``content_size.height`` is
+    always 0 pre-layout).
+    """
+    visible_rows = max(1, visible_rows)
+    if selected < scroll_offset:
+        new_offset = selected
+    elif selected >= scroll_offset + visible_rows:
+        new_offset = selected - visible_rows + 1
+    else:
+        new_offset = scroll_offset
+    # Clamp to valid range.
+    max_offset = max(0, total - visible_rows)
+    return max(0, min(new_offset, max_offset))
+
+
 def diff_viewport_height(
     height: int,
     *,
@@ -292,7 +427,14 @@ class MruFilesPanel(Static):
     substring assertions in tests.
 
     ``can_focus = True`` so Tab/Shift+Tab cycle through the three panels.
-    ↑/↓ keys scroll the visible row window (``_scroll_mru``).
+
+    Smart cursor: ``_selected_index`` is the logical cursor/highlight position
+    (0-based into ``self._rows``).  ``_scroll_offset`` is the viewport top.
+    Navigation keys (↑/↓/Page/Home/End) move ``_selected_index`` and then call
+    :func:`clamp_viewport_to_cursor` to adjust ``_scroll_offset`` only when the
+    cursor leaves the visible window — standard listbox behaviour.  Mouse wheel
+    pans the viewport (``_scroll_offset``) directly WITHOUT moving the cursor or
+    posting :class:`FileClicked`.
     """
 
     can_focus = True
@@ -314,20 +456,32 @@ class MruFilesPanel(Static):
         self._renderable: Text = Text(MRU_EMPTY_TEXT)
         self._rows: list = []  # snapshot of MruEntry rows for click mapping
         self._scroll_offset: int = 0
+        self._selected_index: int = 0  # logical cursor — moves on key nav
         self._last_model: Optional[MruModel] = (
             None  # stored for scroll re-render without a new model push
         )
         self._last_width: int = 0  # stored for scroll re-render at same width
+
+    def _visible_rows(self) -> int:
+        """Number of data rows visible at once (content height minus title chrome).
+
+        Pre-layout (``content_size.height == 0``) → returns 1 as a safe minimum.
+        This is the SAME measure used by ``_page_step``; ``_page_step`` delegates
+        here so there is a single source of truth.
+        """
+        return max(1, self.content_size.height - _PANEL_TITLE_CHROME)
 
     def update_from_model(self, model: MruModel, width: int = 0) -> None:
         """Re-render the panel from the model's current rows."""
         self._last_model = model
         self._last_width = width
         self._rows = model.rows()  # snapshot for click-to-row mapping
-        # Clamp so a shrinking list doesn't leave the offset past the end.
+        # Clamp both cursor and viewport so a shrinking list leaves them valid.
         if self._rows:
+            self._selected_index = min(self._selected_index, len(self._rows) - 1)
             self._scroll_offset = min(self._scroll_offset, len(self._rows) - 1)
         else:
+            self._selected_index = 0
             self._scroll_offset = 0
         self._renderable = render_mru(
             model, self._scroll_offset, width, focused=self.has_focus
@@ -336,7 +490,12 @@ class MruFilesPanel(Static):
             self.refresh()
 
     def _scroll_mru(self, delta: int) -> None:
-        """Adjust _scroll_offset by delta and repaint from the stored model."""
+        """Pan the viewport by ``delta`` rows (wheel / direct callers only).
+
+        This is a VIEWPORT-only operation — it does NOT move ``_selected_index``
+        and does NOT post :class:`FileClicked`.  Mouse wheel handlers call this
+        directly.  Keyboard navigation calls ``_navigate_cursor`` instead.
+        """
         if not self._rows or self._last_model is None:
             return
         self._scroll_offset = max(
@@ -351,6 +510,55 @@ class MruFilesPanel(Static):
         if self.is_mounted:
             self.refresh()
 
+    def _navigate_cursor(self, delta: int) -> None:
+        """Move ``_selected_index`` by ``delta``, clamp viewport, repaint, select.
+
+        This is the KEYBOARD navigation primitive:
+        1. Clamp ``_selected_index + delta`` to ``[0, len(rows)-1]``.
+        2. Call :func:`viewport_offset_for_cursor` (wrap-aware) to adjust
+           ``_scroll_offset`` only when the cursor leaves the visible window.
+           When mounted (``content_size.width > 0``) the per-row physical line
+           counts are computed from the plain-text row lengths so wrapped entries
+           count as multiple physical lines.  When unmounted (pre-layout,
+           ``content_size.width == 0``) ``None`` is passed as ``line_counts`` and
+           the function falls back to the 1-line-per-row
+           :func:`clamp_viewport_to_cursor` behaviour.
+        3. Repaint.
+        4. Post :class:`FileClicked` for the new ``_selected_index`` so the diff
+           panel follows the cursor.
+
+        Mouse wheel handlers use ``_scroll_mru`` instead — they pan the viewport
+        without moving the cursor or posting FileClicked.
+        """
+        if not self._rows or self._last_model is None:
+            return
+        n = len(self._rows)
+        self._selected_index = max(0, min(self._selected_index + delta, n - 1))
+        content_width = self.content_size.width
+        if content_width > 0:
+            line_counts = [
+                _wrapped_line_count(format_mru_row(entry), content_width)
+                for entry in self._rows
+            ]
+        else:
+            line_counts = None  # unmounted fallback: 1 line per row
+        self._scroll_offset = viewport_offset_for_cursor(
+            self._selected_index,
+            self._scroll_offset,
+            self._visible_rows(),
+            n,
+            line_counts=line_counts,
+        )
+        self._renderable = render_mru(
+            self._last_model,
+            self._scroll_offset,
+            self._last_width,
+            focused=self.has_focus,
+        )
+        if self.is_mounted:
+            self.refresh()
+        self._select_at_cursor()
+
     def watch_has_focus(self, has_focus: bool) -> None:
         """Re-highlight the title when keyboard focus enters/leaves this panel."""
         if self._last_model is None:
@@ -362,62 +570,57 @@ class MruFilesPanel(Static):
             self.refresh()
 
     def on_mouse_scroll_up(self, event) -> None:
-        """Translate a wheel-up into a scroll-up (show earlier / top rows)."""
+        """Translate a wheel-up into a viewport pan (scroll-only, no cursor move)."""
         self._scroll_mru(-1)
 
     def on_mouse_scroll_down(self, event) -> None:
-        """Translate a wheel-down into a scroll-down (show later rows)."""
+        """Translate a wheel-down into a viewport pan (scroll-only, no cursor move)."""
         self._scroll_mru(1)
 
     def _page_step(self) -> int:
-        """Rows per page-scroll: content height minus title chrome, floored at 1."""
-        return max(1, self.content_size.height - _PANEL_TITLE_CHROME)
+        """Rows per page-scroll: delegates to _visible_rows() for single source of truth."""
+        return self._visible_rows()
 
-    def _select_at_offset(self) -> None:
-        """Post FileClicked for the entry at _scroll_offset (keyboard selection).
+    def _select_at_cursor(self) -> None:
+        """Post FileClicked for the entry at ``_selected_index`` (keyboard selection).
 
-        Called after every keyboard scroll so that ↑/↓/PageUp/PageDown both
-        move the visible row window AND pin the diff to the newly-highlighted
-        entry — the same effect as clicking a row with the mouse.  Mouse wheel
-        handlers intentionally do NOT call this method (wheel is scroll-only).
+        Called after every keyboard navigation so ↑/↓/Page/Home/End both move
+        the cursor AND pin the diff to the newly-highlighted entry — same effect
+        as clicking a row with the mouse.  Mouse wheel handlers intentionally do
+        NOT call this method (wheel is scroll-only).
         """
-        if self._rows and 0 <= self._scroll_offset < len(self._rows):
+        if self._rows and 0 <= self._selected_index < len(self._rows):
             self.post_message(
-                self.FileClicked(self._rows[self._scroll_offset].event_key)
+                self.FileClicked(self._rows[self._selected_index].event_key)
             )
 
     def on_key(self, event) -> None:
-        """↑/↓/PageUp/PageDown scroll the MRU row window and select the row."""
+        """↑/↓/PageUp/PageDown/Home/End move the cursor and follow the viewport."""
         if event.key == "up":
-            self._scroll_mru(-1)
-            self._select_at_offset()
+            self._navigate_cursor(-1)
             event.stop()
         elif event.key == "down":
-            self._scroll_mru(1)
-            self._select_at_offset()
+            self._navigate_cursor(1)
             event.stop()
         elif event.key == "pagedown":
-            self._scroll_mru(self._page_step())
-            self._select_at_offset()
+            self._navigate_cursor(self._page_step())
             event.stop()
         elif event.key == "pageup":
-            self._scroll_mru(-self._page_step())
-            self._select_at_offset()
+            self._navigate_cursor(-self._page_step())
             event.stop()
         elif event.key == "home":
-            self._scroll_mru(-_SCROLL_TO_EXTREME)
-            self._select_at_offset()
+            self._navigate_cursor(-_SCROLL_TO_EXTREME)
             event.stop()
         elif event.key == "end":
-            self._scroll_mru(_SCROLL_TO_EXTREME)
-            self._select_at_offset()
+            self._navigate_cursor(_SCROLL_TO_EXTREME)
             event.stop()
 
     def on_mouse_down(self, event) -> None:
         """Map mouse-down Y → MRU row, accounting for wrapped long rows.
 
         Focuses the panel first so click-to-focus works, then maps the
-        click to the appropriate MRU row.
+        click to the appropriate MRU row and sets ``_selected_index`` so
+        subsequent arrow keys move relative to the clicked row.
 
         Uses on_mouse_down instead of on_click because under tmux the button
         release event is not forwarded (tmux's root MouseDown1Pane binding
@@ -439,11 +642,13 @@ class MruFilesPanel(Static):
         if content_width <= 0:
             return
         remaining = event.offset.y - _HEADER_LINES
-        for entry in self._rows[self._scroll_offset :]:
+        for loop_pos, entry in enumerate(self._rows[self._scroll_offset :]):
             plain = format_mru_row(entry)
             # integer ceil without math import: (a + b - 1) // b
             entry_lines = max(1, (len(plain) + content_width - 1) // content_width)
             if remaining < entry_lines:
+                # Update _selected_index so arrow keys are relative to clicked row.
+                self._selected_index = self._scroll_offset + loop_pos
                 self.post_message(self.FileClicked(entry.event_key))
                 return
             remaining -= entry_lines

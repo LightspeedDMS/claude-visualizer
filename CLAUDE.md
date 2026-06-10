@@ -244,13 +244,39 @@ Routing is by event type: `FileModifiedEvent` → MRU + diff queue; `CommandEven
   `has_focus` reactive, so the re-render reads a stale `False` and the title never
   highlights (this regressed silently once). The steady-state refresh path
   (`update_from_*`) also passes `focused=self.has_focus`.
-- **`↑`/`↓` scroll the focused panel.** Each panel's `on_key` handles ONLY
-  `up`/`down` and calls `event.stop()` (so `tab`/`q`/`p`/`shift+*` still bubble):
-  MRU → `_scroll_mru(±1)`, Commands → `_scroll_commands(±1)`, Diff → posts
-  `DiffScrolled(±1)` which the app forwards to `DiffQueueModel.scroll_pin_by()` —
-  a no-op unless pinned, so **`↑`/`↓` scroll the Diff ONLY when pinned** (same
-  rule as the wheel; press `p` or click an MRU row to pin).
-- **`PageUp`/`PageDown` scroll the focused panel by ~a screenful** (`_page_step()` = `content_size.height − _PANEL_TITLE_CHROME`), same focused/pinned rules as `↑`/`↓` (Diff pages only when pinned).
+- **`↑`/`↓` on MRU move a keyboard cursor, NOT the scroll offset.** `MruFilesPanel`
+  holds `_selected_index` (cursor row in the full model list) alongside
+  `_scroll_offset` (first visible row). `↑`/`↓` call `_navigate_cursor(±1)`, which
+  clamps `_selected_index` to `[0, len-1]`, calls `clamp_viewport_to_cursor` to
+  keep the cursor inside the viewport, then posts a `FileClicked` message so the
+  diff panel pins to that file. `Home`/`End` jump to the first/last row and
+  likewise post `FileClicked`. Mouse-wheel on MRU moves `_scroll_offset` directly
+  WITHOUT updating `_selected_index` (wheel = browse; `↑`/`↓` = select).
+  `update_from_model` clamps `_selected_index` when the list shrinks, and resets
+  both to 0 when the list becomes empty.
+- **`clamp_viewport_to_cursor(cursor, offset, visible, total) -> int`** is a PURE
+  module-level helper in `panels.py` (no widget state). Returns a new offset that
+  keeps `cursor` inside `[offset, offset+visible)`, clamped so offset ≥ 0 and
+  offset+visible ≤ total. Used by MRU navigation; also directly unit-tested via
+  `TestClampViewportToCursor`.
+- **`↑`/`↓` scroll the focused panel (Diff / Commands).** For `DiffPanel` and
+  `CommandsPanel` the keys call `event.stop()` (so `tab`/`q`/`p`/`shift+*` still
+  bubble): Commands → `_scroll_commands(±1)`, Diff → posts `DiffScrolled(±1)`
+  which the app forwards to `DiffQueueModel.scroll_pin_by()` — a no-op unless
+  pinned, so **`↑`/`↓` scroll the Diff ONLY when pinned** (same rule as the
+  wheel; press `p` or click an MRU row to pin).
+- **`←`/`→` horizontally scroll the Commands panel.** `CommandsPanel.on_key`
+  handles `left`/`right` by calling `_h_scroll_commands(±1)`, which increments/
+  decrements `_h_scroll_offset` (clamped at 0; no hard upper bound — the text
+  simply runs out). `_h_scroll_offset` is passed to `render_commands` and
+  ultimately to `scroll_command(text, width, h_scroll)`, which slices the
+  collapsed single-line command text by character offset, prepending `‹` when
+  scrolled right and respecting the available width. `_h_scroll_offset` resets to
+  0 whenever `update_from_model` fires with `_follow=True` (i.e., when a new
+  command arrives and the panel is following the newest row) — so the scroll
+  position is preserved while the user is browsing but cleared when autoscroll
+  resumes.
+- **`PageUp`/`PageDown` scroll the focused panel by ~a screenful** (`_page_step()` = `content_size.height − _PANEL_TITLE_CHROME`), same focused/pinned rules as `↑`/`↓` (Diff pages only when pinned; MRU pages move the cursor).
 - **Commands autoscroll-follow.** `CommandsPanel` holds `_scroll_offset` +
   `_follow` (+ `_last_model`/`_last_width` for re-render). `render_commands`
   renders `rows[scroll_offset:]` (rows are newest-first → offset 0 = newest at
