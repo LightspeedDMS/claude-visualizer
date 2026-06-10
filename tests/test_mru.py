@@ -184,20 +184,34 @@ class TestOrdering:
 
 
 # ---------------------------------------------------------------------------
-# record() — dedup / move-to-front
+# record() — event-key dedup (same path+ts = same key → move-to-front)
 # ---------------------------------------------------------------------------
+# NOTE: The old "dedup by file_path" behavior has been replaced by the
+# event-key model: the key is (file_path, ts).  Same path with DIFFERENT
+# timestamps produces separate entries.  Same path with the SAME timestamp
+# (exact same key) still deduplicates (move-to-front).
 
 
 class TestDedupMoveToFront:
-    def test_same_path_not_duplicated(self):
+    def test_same_key_deduplicated(self):
+        """Same (file_path, ts) key is deduplicated — move-to-front."""
+        ts = datetime(2025, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
         model = MruModel(AppConfig())
-        model.record(_evt(file_path="/a.py"))
-        model.record(_evt(file_path="/a.py"))
+        model.record(_evt(file_path="/a.py", ts=ts))
+        model.record(_evt(file_path="/a.py", ts=ts))
         assert len(model.rows()) == 1
 
-    def test_repeat_moves_to_front(self):
-        # Explicit timestamps: t1 < t2 < t3 < t4 so the second /a.py touch
-        # (t4 = newest) sorts first, /c.py (t3) second, /b.py (t2) last.
+    def test_same_path_different_ts_is_two_entries(self):
+        """Same path, different timestamp = two distinct event-key entries."""
+        t1 = datetime(2025, 1, 1, 10, 0, 1, tzinfo=timezone.utc)
+        t2 = datetime(2025, 1, 1, 10, 0, 2, tzinfo=timezone.utc)
+        model = MruModel(AppConfig())
+        model.record(_evt(file_path="/a.py", ts=t1))
+        model.record(_evt(file_path="/a.py", ts=t2))
+        assert len(model.rows()) == 2
+
+    def test_four_distinct_events_all_appear(self):
+        """Four events with distinct (path, ts) keys → four rows, newest arrival first."""
         t1 = datetime(2025, 1, 1, 10, 0, 1, tzinfo=timezone.utc)
         t2 = datetime(2025, 1, 1, 10, 0, 2, tzinfo=timezone.utc)
         t3 = datetime(2025, 1, 1, 10, 0, 3, tzinfo=timezone.utc)
@@ -206,23 +220,36 @@ class TestDedupMoveToFront:
         model.record(_evt(file_path="/a.py", ts=t1))
         model.record(_evt(file_path="/b.py", ts=t2))
         model.record(_evt(file_path="/c.py", ts=t3))
-        # Touch /a.py again with a newer timestamp → it should sort to the front.
         model.record(_evt(file_path="/a.py", ts=t4))
-        assert [r.file_path for r in model.rows()] == ["/a.py", "/c.py", "/b.py"]
+        rows = model.rows()
+        assert len(rows) == 4
+        # Newest arrival (/a.py t4) is first
+        assert rows[0].file_path == "/a.py"
+        assert rows[0].ts == t4
 
-    def test_repeat_updates_origin_fields(self):
+    def test_same_key_move_to_front_updates_fields(self):
+        """Re-recording the same (path, ts) key moves it to front and refreshes fields."""
+        ts = datetime(2025, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
         model = MruModel(AppConfig())
-        model.record(_evt(file_path="/a.py", project_tag="old", op=FileOp.WRITE))
-        model.record(_evt(file_path="/a.py", project_tag="new", op=FileOp.EDIT))
+        model.record(_evt(file_path="/b.py", ts=ts))
+        model.record(_evt(file_path="/a.py", ts=ts, project_tag="old", op=FileOp.WRITE))
+        # Now re-record /a.py with same ts but updated fields
+        model.record(_evt(file_path="/a.py", ts=ts, project_tag="new", op=FileOp.EDIT))
+        # Still only 2 entries (same key deduped)
+        assert len(model.rows()) == 2
+        # /a.py (same key, re-recorded last) is at front
         entry = model.rows()[0]
+        assert entry.file_path == "/a.py"
         assert entry.project_tag == "new"
         assert entry.op == FileOp.EDIT
-        assert len(model.rows()) == 1
 
-    def test_repeat_updates_subagent_flag(self):
+    def test_same_key_updates_subagent_flag(self):
+        """Re-recording same (path, ts) key refreshes is_subagent."""
+        ts = datetime(2025, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
         model = MruModel(AppConfig())
-        model.record(_evt(file_path="/a.py", is_subagent=False))
-        model.record(_evt(file_path="/a.py", is_subagent=True))
+        model.record(_evt(file_path="/a.py", ts=ts, is_subagent=False))
+        model.record(_evt(file_path="/a.py", ts=ts, is_subagent=True))
+        assert len(model.rows()) == 1
         assert model.rows()[0].is_subagent is True
 
 
@@ -289,6 +316,71 @@ class TestCapacityFalloff:
 # ---------------------------------------------------------------------------
 
 
+class TestEventKeyBehavior:
+    """Tests for the new (file_path, ts) event-key model (no dedup, arrival order)."""
+
+    def test_event_key_property_exists(self):
+        model = MruModel(AppConfig())
+        entry = model.record(_evt(file_path="/a.py"))
+        assert hasattr(entry, "event_key")
+
+    def test_event_key_is_tuple_of_path_and_ts(self):
+        ts = datetime(2025, 6, 1, 10, 0, 0, tzinfo=timezone.utc)
+        model = MruModel(AppConfig())
+        entry = model.record(_evt(file_path="/a.py", ts=ts))
+        assert entry.event_key == ("/a.py", ts)
+
+    def test_same_path_different_ts_creates_two_entries(self):
+        """Same file path with distinct timestamps is NOT deduplicated."""
+        t1 = datetime(2025, 6, 1, 10, 0, 0, tzinfo=timezone.utc)
+        t2 = datetime(2025, 6, 1, 10, 0, 1, tzinfo=timezone.utc)
+        model = MruModel(AppConfig())
+        model.record(_evt(file_path="/a.py", ts=t1))
+        model.record(_evt(file_path="/a.py", ts=t2))
+        assert len(model.rows()) == 2
+
+    def test_arrival_order_is_display_order_no_timestamp_sort(self):
+        """rows() returns newest-arrival first (insertion order reversed), no ts sort."""
+        t_old = datetime(2025, 6, 1, 10, 0, 0, tzinfo=timezone.utc)
+        t_new = datetime(2025, 6, 1, 10, 0, 1, tzinfo=timezone.utc)
+        model = MruModel(AppConfig())
+        # Record older timestamp SECOND — display should still put it first (latest arrival)
+        model.record(_evt(file_path="/a.py", ts=t_new))
+        model.record(_evt(file_path="/b.py", ts=t_old))
+        rows = model.rows()
+        # /b.py arrived last → appears first in output
+        assert rows[0].file_path == "/b.py"
+        assert rows[1].file_path == "/a.py"
+
+    def test_highlighted_key_attribute_exists(self):
+        model = MruModel(AppConfig())
+        assert hasattr(model, "highlighted_key")
+
+    def test_highlighted_key_default_is_none(self):
+        model = MruModel(AppConfig())
+        assert model.highlighted_key is None
+
+    def test_highlighted_key_settable(self):
+        ts = datetime(2025, 6, 1, 10, 0, 0, tzinfo=timezone.utc)
+        model = MruModel(AppConfig())
+        model.highlighted_key = ("/a.py", ts)
+        assert model.highlighted_key == ("/a.py", ts)
+
+    def test_lru_eviction_by_arrival_order(self):
+        """When at capacity, oldest-arrival entry is evicted, not oldest-timestamp."""
+        t1 = datetime(2025, 6, 1, 10, 0, 0, tzinfo=timezone.utc)
+        t2 = datetime(2025, 6, 1, 10, 0, 1, tzinfo=timezone.utc)
+        t3 = datetime(2025, 6, 1, 10, 0, 2, tzinfo=timezone.utc)
+        # cap=2; record 3 events; first arrival (t1 with /a.py) gets evicted
+        model = MruModel(AppConfig(mru_max=2))
+        e1 = model.record(_evt(file_path="/a.py", ts=t1))
+        model.record(_evt(file_path="/b.py", ts=t2))
+        model.record(_evt(file_path="/c.py", ts=t3))
+        keys = [r.event_key for r in model.rows()]
+        assert e1.event_key not in keys  # oldest arrival evicted
+        assert len(keys) == 2
+
+
 class TestRowsSnapshot:
     def test_rows_is_a_list(self):
         model = MruModel(AppConfig())
@@ -305,18 +397,21 @@ class TestRowsSnapshot:
 
 
 # ---------------------------------------------------------------------------
-# rows() — timestamp-based display ordering (cross-session interleave fix)
+# rows() — arrival-order display (event-key model, no timestamp sort)
 # ---------------------------------------------------------------------------
+# NOTE: The model now uses arrival order (insertion order reversed) — no
+# timestamp sort.  The old timestamp-sort tests have been updated to reflect
+# the new behavior.
 
 
 class TestRowsTimestampOrdering:
-    def test_rows_sorted_by_timestamp_not_arrival(self):
-        """Events arriving out-of-timestamp-order are displayed by timestamp.
+    def test_rows_arrival_order_not_timestamp_order(self):
+        """rows() returns newest-arrival first, regardless of event timestamps.
 
         Simulates: session A's tailer drains two events (18:09, 18:27),
         then session B's tailer drains one event (18:24).
         Arrival order: 18:09, 18:27, 18:24
-        Expected display order: 18:27, 18:24, 18:09
+        Expected display order (newest arrival first): 18:24, 18:27, 18:09
         """
         model = MruModel(AppConfig())
 
@@ -360,26 +455,15 @@ class TestRowsTimestampOrdering:
 
         rows = model.rows()
         assert len(rows) == 3
-        # Display order must be by timestamp descending: 18:27, 18:24, 18:09
-        assert rows[0].file_path == "/a/latest.py"  # 18:27
-        assert rows[1].file_path == "/b/middle.py"  # 18:24
-        assert rows[2].file_path == "/a/early.py"  # 18:09
+        # Display order is newest-arrival first: ev3 (18:24), ev2 (18:27), ev1 (18:09)
+        assert rows[0].file_path == "/b/middle.py"  # arrived last → first
+        assert rows[1].file_path == "/a/latest.py"  # arrived second → second
+        assert rows[2].file_path == "/a/early.py"  # arrived first → last
 
-    def test_rows_none_ts_sorts_to_end(self):
-        """Entries with ts=None appear after all timestamped entries."""
+    def test_rows_none_ts_arrival_order(self):
+        """Entries with ts=None appear in arrival order with other entries."""
         model = MruModel(AppConfig())
 
-        ev_with_ts = FileModifiedEvent(
-            file_path="/a/timestamped.py",
-            op=FileOp.EDIT,
-            session_id="sess-aaa",
-            project_tag="projA",
-            is_subagent=False,
-            source_path="/src/a.jsonl",
-            old_string="x",
-            new_string="y",
-            ts=datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
-        )
         ev_no_ts = FileModifiedEvent(
             file_path="/b/no_timestamp.py",
             op=FileOp.EDIT,
@@ -391,10 +475,23 @@ class TestRowsTimestampOrdering:
             new_string="y",
             ts=None,
         )
+        ev_with_ts = FileModifiedEvent(
+            file_path="/a/timestamped.py",
+            op=FileOp.EDIT,
+            session_id="sess-aaa",
+            project_tag="projA",
+            is_subagent=False,
+            source_path="/src/a.jsonl",
+            old_string="x",
+            new_string="y",
+            ts=datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        )
 
+        # ev_no_ts arrives first, ev_with_ts arrives second
         model.record(ev_no_ts)
         model.record(ev_with_ts)
 
         rows = model.rows()
-        assert rows[0].file_path == "/a/timestamped.py"  # has ts → first
-        assert rows[1].file_path == "/b/no_timestamp.py"  # None → last
+        # Newest arrival (ev_with_ts) is first regardless of ts=None on the other
+        assert rows[0].file_path == "/a/timestamped.py"  # arrived last → first
+        assert rows[1].file_path == "/b/no_timestamp.py"  # arrived first → last

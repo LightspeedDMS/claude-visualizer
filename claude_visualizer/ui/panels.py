@@ -56,7 +56,7 @@ ORIGIN_SEP = "·"
 MRU_EMPTY_TEXT = "Waiting for file activity across sessions…"
 
 # Header line for the active panel.
-MRU_TITLE = "MRU Files — live cross-session"
+MRU_TITLE = "Most Recent File Events"
 
 # Prefix marking the highlighted (currently-displayed) row in the MRU list so
 # the selection is visible both in the rendered text (tests) and on screen.
@@ -236,7 +236,7 @@ def render_mru(
         out.append(MRU_EMPTY_TEXT)
         return out
     for index, entry in enumerate(visible):
-        is_hl = entry.file_path == model.highlighted_path
+        is_hl = entry.event_key == model.highlighted_key
         if is_hl:
             # Highlighted rows: plain string + MRU_HIGHLIGHT_STYLE.
             # bold reverse conflicts with per-field colors; keep plain.
@@ -296,13 +296,18 @@ class MruFilesPanel(Static):
     """
 
     can_focus = True
+    ALLOW_SELECT = False
 
     class FileClicked(Message):
-        """Posted when the user clicks a file row in the MRU list."""
+        """Posted when the user clicks a file row in the MRU list.
 
-        def __init__(self, file_path: str) -> None:
+        ``event_key`` is the ``(file_path, ts)`` tuple identifying the clicked
+        event — the same key used by the diff queue's ``pin()`` method.
+        """
+
+        def __init__(self, event_key: tuple) -> None:
             super().__init__()
-            self.file_path = file_path
+            self.event_key = event_key
 
     def __init__(self, **kwargs) -> None:
         super().__init__(MRU_EMPTY_TEXT, **kwargs)
@@ -378,7 +383,7 @@ class MruFilesPanel(Static):
         """
         if self._rows and 0 <= self._scroll_offset < len(self._rows):
             self.post_message(
-                self.FileClicked(self._rows[self._scroll_offset].file_path)
+                self.FileClicked(self._rows[self._scroll_offset].event_key)
             )
 
     def on_key(self, event) -> None:
@@ -439,7 +444,7 @@ class MruFilesPanel(Static):
             # integer ceil without math import: (a + b - 1) // b
             entry_lines = max(1, (len(plain) + content_width - 1) // content_width)
             if remaining < entry_lines:
-                self.post_message(self.FileClicked(entry.file_path))
+                self.post_message(self.FileClicked(entry.event_key))
                 return
             remaining -= entry_lines
 
@@ -586,6 +591,7 @@ class DiffPanel(Static):
     """
 
     can_focus = True
+    ALLOW_SELECT = False
 
     class DiffScrolled(Message):
         """Posted when the user scrolls the diff panel with the mouse wheel.
@@ -829,6 +835,7 @@ class CommandsPanel(Static):
     """
 
     can_focus = True
+    ALLOW_SELECT = False
 
     def __init__(self, **kwargs) -> None:
         super().__init__(COMMANDS_EMPTY_TEXT, **kwargs)
@@ -1023,10 +1030,13 @@ class MonitorBar(Static):
     equals the number of active monitor rows automatically (AC3).
     """
 
+    ALLOW_SELECT = False
+
     DEFAULT_CSS = """
     MonitorBar {
         dock: bottom;
         height: auto;
+        background: #2d2420;
     }
     """
 
@@ -1079,12 +1089,25 @@ class MonitorBar(Static):
 
 
 class SplitterHandle(Widget):
-    """Thin │ vertical line between MRU and Diff panels — visual only.
+    """Thin │ vertical line between MRU and Diff panels — draggable splitter.
 
     Renders a column of │ box-drawing characters on the default background so
-    it appears as a thin line rather than a filled colour block.  No focus, no
-    key bindings — arrow-key resizing lives in app-level bindings.
+    it appears as a thin line rather than a filled colour block.  Arrow-key
+    resizing lives in app-level bindings; mouse drag fires :class:`SplitterDragged`
+    so the app can adjust the MRU panel width in real time.
     """
+
+    class SplitterDragged(Message):
+        """Posted while the user drags the vertical splitter handle.
+
+        ``delta_x`` is the signed horizontal movement in screen columns since
+        the last event (positive = moved right, negative = moved left).  The
+        app adds this to ``_mru_width`` and clamps at ``_MRU_MIN_WIDTH``.
+        """
+
+        def __init__(self, delta_x: int) -> None:
+            super().__init__()
+            self.delta_x = delta_x
 
     DEFAULT_CSS = """
     SplitterHandle {
@@ -1092,6 +1115,37 @@ class SplitterHandle(Widget):
         height: 100%;
     }
     """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._dragging = False
+        self._drag_start_x = 0
+
+    def on_mouse_down(self, event) -> None:
+        """Begin drag: capture mouse so move/up events arrive even outside bounds."""
+        self._dragging = True
+        self._drag_start_x = event.screen_x
+        self.capture_mouse()
+        event.prevent_default()
+        event.stop()
+
+    def on_mouse_move(self, event) -> None:
+        """Fire SplitterDragged for each column moved during a drag."""
+        if self._dragging:
+            delta = event.screen_x - self._drag_start_x
+            if delta != 0:
+                self.post_message(self.SplitterDragged(delta))
+                self._drag_start_x = event.screen_x
+            event.prevent_default()
+            event.stop()
+
+    def on_mouse_up(self, event) -> None:
+        """End drag: release mouse capture."""
+        if self._dragging:
+            self._dragging = False
+            self.release_mouse()
+            event.prevent_default()
+            event.stop()
 
     def render(self) -> Text:
         height = max(1, self.size.height)
@@ -1102,8 +1156,22 @@ class HorizontalSeparator(Widget):
     """Thin ─ horizontal line between the top panels and the bottom Commands panel.
 
     Renders a row of ─ box-drawing characters on the default background so it
-    appears as a thin line rather than a filled colour block.  Purely structural.
+    appears as a thin line rather than a filled colour block.  Mouse drag fires
+    :class:`SeparatorDragged` so the app can adjust the Commands panel height.
     """
+
+    class SeparatorDragged(Message):
+        """Posted while the user drags the horizontal separator.
+
+        ``delta_y`` is the signed vertical movement in screen rows since
+        the last event (positive = moved down, negative = moved up).  The
+        app subtracts this from ``_bottom_height`` and clamps at
+        ``_BOTTOM_MIN_HEIGHT``.
+        """
+
+        def __init__(self, delta_y: int) -> None:
+            super().__init__()
+            self.delta_y = delta_y
 
     DEFAULT_CSS = """
     HorizontalSeparator {
@@ -1111,6 +1179,37 @@ class HorizontalSeparator(Widget):
         width: 100%;
     }
     """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._dragging = False
+        self._drag_start_y = 0
+
+    def on_mouse_down(self, event) -> None:
+        """Begin drag: capture mouse so move/up events arrive even outside bounds."""
+        self._dragging = True
+        self._drag_start_y = event.screen_y
+        self.capture_mouse()
+        event.prevent_default()
+        event.stop()
+
+    def on_mouse_move(self, event) -> None:
+        """Fire SeparatorDragged for each row moved during a drag."""
+        if self._dragging:
+            delta = event.screen_y - self._drag_start_y
+            if delta != 0:
+                self.post_message(self.SeparatorDragged(delta))
+                self._drag_start_y = event.screen_y
+            event.prevent_default()
+            event.stop()
+
+    def on_mouse_up(self, event) -> None:
+        """End drag: release mouse capture."""
+        if self._dragging:
+            self._dragging = False
+            self.release_mouse()
+            event.prevent_default()
+            event.stop()
 
     def render(self) -> Text:
         width = max(1, self.size.width)

@@ -396,7 +396,7 @@ class TestRenderMru:
         model = MruModel(AppConfig(mru_max=10))
         model.record(_file_event(file_path="/r/a.py", ts=t_old))  # row 1 (odd)
         model.record(_file_event(file_path="/r/b.py", ts=t_new))  # row 0 (even, newest)
-        model.highlighted_path = "/r/a.py"
+        model.highlighted_key = ("/r/a.py", t_old)
         text = render_mru(model)
         zebra = [s for s in text.spans if MRU_ROW_STYLE_ODD in str(s.style)]
         highlight = [s for s in text.spans if MRU_HIGHLIGHT_STYLE in str(s.style)]
@@ -3029,7 +3029,7 @@ class TestMruKeyboardSelect:
         assert len(panel.posted) == 1
         msg = panel.posted[0]
         assert isinstance(msg, MruFilesPanel.FileClicked)
-        assert msg.file_path == panel._rows[1].file_path
+        assert msg.event_key == panel._rows[1].event_key
 
     def test_up_key_from_non_zero_offset_posts_file_clicked(self):
         """↑ decrements offset and posts FileClicked for the row now at offset."""
@@ -3043,7 +3043,7 @@ class TestMruKeyboardSelect:
         assert len(panel.posted) == 1
         msg = panel.posted[0]
         assert isinstance(msg, MruFilesPanel.FileClicked)
-        assert msg.file_path == panel._rows[1].file_path
+        assert msg.event_key == panel._rows[1].event_key
 
     def test_up_key_at_offset_zero_posts_file_clicked_for_row_zero(self):
         """↑ at offset 0 stays at 0 and posts FileClicked for rows()[0]."""
@@ -3054,7 +3054,7 @@ class TestMruKeyboardSelect:
 
         assert panel._scroll_offset == 0
         assert len(panel.posted) == 1
-        assert panel.posted[0].file_path == panel._rows[0].file_path
+        assert panel.posted[0].event_key == panel._rows[0].event_key
 
     def test_empty_panel_down_key_does_not_post_file_clicked(self):
         """↓ on an empty panel (no rows) must NOT post FileClicked."""
@@ -3076,7 +3076,7 @@ class TestMruKeyboardSelectPageDown:
         assert len(panel.posted) == 1
         msg = panel.posted[0]
         assert isinstance(msg, MruFilesPanel.FileClicked)
-        assert msg.file_path == panel._rows[panel._scroll_offset].file_path
+        assert msg.event_key == panel._rows[panel._scroll_offset].event_key
 
     def test_pageup_posts_file_clicked_at_new_offset(self):
         """PageUp scrolls back and posts FileClicked for the row at new offset."""
@@ -3089,7 +3089,7 @@ class TestMruKeyboardSelectPageDown:
         assert len(panel.posted) == 1
         msg = panel.posted[0]
         assert isinstance(msg, MruFilesPanel.FileClicked)
-        assert msg.file_path == panel._rows[panel._scroll_offset].file_path
+        assert msg.event_key == panel._rows[panel._scroll_offset].event_key
 
 
 class TestMruMouseWheelNoSelect:

@@ -191,25 +191,36 @@ class TestCoalesceByFile:
         assert "b-v2-updated" in adds
         assert "b-v1" not in adds
 
-    def test_reedit_keeps_queue_position_not_reappended(self):
+    def test_reedit_same_key_moves_to_back_of_queue(self):
+        # With event-key model: re-recording same (path, ts) key moves entry to
+        # the back (most-recent position) — it becomes the newest item in the FIFO.
+        # This is different from the old path-coalescing which kept the original
+        # queue position; now the same key gets refreshed and moved to newest.
+        from datetime import timezone
+
+        t_a = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        t_b = datetime(2024, 1, 1, 0, 0, 1, tzinfo=timezone.utc)
+        t_c = datetime(2024, 1, 1, 0, 0, 2, tzinfo=timezone.utc)
+        t_d = datetime(2024, 1, 1, 0, 0, 3, tzinfo=timezone.utc)
         clock = FakeClock()
         model = DiffQueueModel(
             AppConfig(min_dwell_seconds=0, max_dwell_seconds=1), now=clock
         )
         # Queue three behind the displayed one: order B, C, D.
-        model.record(_write("/repo/A.py", "a"))
-        model.record(_write("/repo/B.py", "b"))
-        model.record(_write("/repo/C.py", "c"))
-        model.record(_write("/repo/D.py", "d"))
+        model.record(_write("/repo/A.py", "a", ts=t_a))
+        model.record(_write("/repo/B.py", "b", ts=t_b))
+        model.record(_write("/repo/C.py", "c", ts=t_c))
+        model.record(_write("/repo/D.py", "d", ts=t_d))
         model.tick(clock(), viewport_height=10)  # A displayed
-        # Re-edit B while still queued — must NOT jump to the back.
-        model.record(_edit("/repo/B.py", "b", "b2"))
+        # Re-record B with the SAME (path, ts) key → moves to back (newest).
+        model.record(_write("/repo/B.py", "b2", ts=t_b))
         order = []
         for _ in range(3):
             clock.advance(2)  # exceed max dwell → advance each tick
             s = model.tick(clock(), viewport_height=10)
             order.append(s.file_path)
-        assert order == ["/repo/B.py", "/repo/C.py", "/repo/D.py"]
+        # B moved to back: C, D are now at the front; B is last.
+        assert order == ["/repo/C.py", "/repo/D.py", "/repo/B.py"]
 
     def test_recording_currently_displayed_file_updates_it(self):
         clock = FakeClock()
@@ -484,23 +495,28 @@ class TestPinBehavior:
             project_tag=project,
         )
 
+    def _key_for(self, path: str, session: str = "sess1234") -> tuple:
+        """Return the event key for a path recorded via _edit_event."""
+        # _edit_event uses ts=TS (the module-level constant)
+        return (path, TS)
+
     def test_pin_unknown_file_returns_false(self):
         config = AppConfig()
         q = DiffQueueModel(config, now=lambda: 0.0)
-        assert q.pin("/nonexistent.py", 0.0) is False
+        assert q.pin(("/nonexistent.py", TS), 0.0) is False
 
     def test_pin_known_file_returns_true(self):
         config = AppConfig()
         q = DiffQueueModel(config, now=lambda: 0.0)
         q.record(self._edit_event())
-        assert q.pin("/repo/a.py", 0.0) is True
+        assert q.pin(self._key_for("/repo/a.py"), 0.0) is True
 
     def test_pin_state_is_pinned_flag(self):
         config = AppConfig()
         t = [0.0]
         q = DiffQueueModel(config, now=lambda: t[0])
         q.record(self._edit_event())
-        q.pin("/repo/a.py", t[0])
+        q.pin(self._key_for("/repo/a.py"), t[0])
         state = q.tick(t[0], 20)
         assert state.is_pinned is True
         assert state.file_path == "/repo/a.py"
@@ -510,7 +526,7 @@ class TestPinBehavior:
         t = [0.0]
         q = DiffQueueModel(config, now=lambda: t[0])
         q.record(self._edit_event("/repo/a.py"))
-        q.pin("/repo/a.py", t[0])
+        q.pin(self._key_for("/repo/a.py"), t[0])
         # New event arrives at t=5 (within pin window)
         t[0] = 5.0
         q.record(self._edit_event("/repo/b.py"))
@@ -523,7 +539,7 @@ class TestPinBehavior:
         t = [0.0]
         q = DiffQueueModel(config, now=lambda: t[0])
         q.record(self._edit_event("/repo/a.py"))
-        q.pin("/repo/a.py", t[0])
+        q.pin(self._key_for("/repo/a.py"), t[0])
         # New event arrives at t=5, then we tick past 10 s
         t[0] = 5.0
         q.record(self._edit_event("/repo/b.py"))
@@ -537,7 +553,7 @@ class TestPinBehavior:
         t = [0.0]
         q = DiffQueueModel(config, now=lambda: t[0])
         q.record(self._edit_event("/repo/a.py"))
-        q.pin("/repo/a.py", t[0])
+        q.pin(self._key_for("/repo/a.py"), t[0])
         # No new events; tick past 10 s
         t[0] = 15.0
         state = q.tick(t[0], 20)
@@ -569,13 +585,17 @@ class TestPinScroll:
         new = _tall_content(lines) + "\nextra"
         return _edit(path, old, new)
 
+    def _tall_edit_key(self, path: str = "/repo/a.py") -> tuple:
+        """Return the event key for a tall edit event."""
+        return (path, TS)
+
     def test_scroll_pin_by_moves_scroll_offset(self):
         """scroll_pin_by(2, 5) followed by tick returns scroll_offset == 2."""
         config = AppConfig(min_pin_seconds=60.0)
         t = [0.0]
         q = DiffQueueModel(config, now=lambda: t[0])
         q.record(self._tall_edit())
-        q.pin("/repo/a.py", t[0])
+        q.pin(self._tall_edit_key(), t[0])
         q.scroll_pin_by(2, 5)
         state = q.tick(t[0], 5)
         assert state is not None
@@ -588,7 +608,7 @@ class TestPinScroll:
         t = [0.0]
         q = DiffQueueModel(config, now=lambda: t[0])
         q.record(self._tall_edit())
-        q.pin("/repo/a.py", t[0])
+        q.pin(self._tall_edit_key(), t[0])
         q.scroll_pin_by(9999, 5)
         state = q.tick(t[0], 5)
         assert state is not None
@@ -601,7 +621,7 @@ class TestPinScroll:
         t = [0.0]
         q = DiffQueueModel(config, now=lambda: t[0])
         q.record(self._tall_edit())
-        q.pin("/repo/a.py", t[0])
+        q.pin(self._tall_edit_key(), t[0])
         q.scroll_pin_by(5, 5)  # scroll down first
         q.scroll_pin_by(-9999, 5)  # scroll up past 0
         state = q.tick(t[0], 5)
@@ -614,10 +634,10 @@ class TestPinScroll:
         t = [0.0]
         q = DiffQueueModel(config, now=lambda: t[0])
         q.record(self._tall_edit())
-        q.pin("/repo/a.py", t[0])
+        q.pin(self._tall_edit_key(), t[0])
         q.scroll_pin_by(5, 5)
         # Re-pin — scroll must reset
-        q.pin("/repo/a.py", t[0])
+        q.pin(self._tall_edit_key(), t[0])
         state = q.tick(t[0], 5)
         assert state is not None
         assert state.scroll_offset == 0
@@ -678,8 +698,8 @@ class TestFastForwardToLatest:
         assert state.file_path == "/repo/gamma.py"
         assert state.is_idle is True
 
-    def test_fast_forward_does_not_affect_event_by_path(self):
-        # _event_by_path is the pin-cache; fast_forward must NOT clear it so
+    def test_fast_forward_does_not_affect_event_by_key(self):
+        # _event_by_key is the pin-cache; fast_forward must NOT clear it so
         # the user can still pin any of the replayed files via click/keyboard.
         clock = FakeClock()
         model = DiffQueueModel(AppConfig(), now=clock)
@@ -687,9 +707,108 @@ class TestFastForwardToLatest:
         model.record(_write("/repo/beta.py", "b"))
         model.record(_write("/repo/gamma.py", "c"))
         model.fast_forward_to_latest(now=0.0)
-        assert "/repo/alpha.py" in model._event_by_path
-        assert "/repo/beta.py" in model._event_by_path
-        assert "/repo/gamma.py" in model._event_by_path
+        # Keys are (file_path, ts) tuples; TS is the module-level constant
+        # used by _write() helper
+        keys = list(model._event_by_key.keys())
+        paths = [k[0] for k in keys]
+        assert "/repo/alpha.py" in paths
+        assert "/repo/beta.py" in paths
+        assert "/repo/gamma.py" in paths
+
+
+# ---------------------------------------------------------------------------
+# event_key in DisplayState
+# ---------------------------------------------------------------------------
+
+
+class TestEventKeyInDisplayState:
+    """DisplayState now carries event_key: the (file_path, ts) tuple of the shown event."""
+
+    def test_display_state_has_event_key_field(self):
+        clock = FakeClock()
+        model = DiffQueueModel(AppConfig(), now=clock)
+        model.record(_write("/repo/a.py", "hello", ts=TS))
+        state = model.tick(clock(), viewport_height=10)
+        assert hasattr(state, "event_key")
+
+    def test_event_key_is_tuple_of_path_and_ts(self):
+        clock = FakeClock()
+        model = DiffQueueModel(AppConfig(), now=clock)
+        model.record(_write("/repo/a.py", "hello", ts=TS))
+        state = model.tick(clock(), viewport_height=10)
+        assert state.event_key == ("/repo/a.py", TS)
+
+    def test_empty_state_event_key_is_none(self):
+        clock = FakeClock()
+        model = DiffQueueModel(AppConfig(), now=clock)
+        state = model.tick(clock(), viewport_height=10)
+        assert state is not None
+        assert state.event_key is None
+
+    def test_pinned_state_event_key_is_pinned_key(self):
+        clock = FakeClock()
+        model = DiffQueueModel(AppConfig(), now=clock)
+        model.record(_write("/repo/a.py", "hello", ts=TS))
+        key = ("/repo/a.py", TS)
+        model.pin(key, clock())
+        state = model.tick(clock(), viewport_height=10)
+        assert state is not None
+        assert state.event_key == key
+
+
+# ---------------------------------------------------------------------------
+# No-coalescing: same path, different ts = two separate queue entries
+# ---------------------------------------------------------------------------
+
+
+class TestNoCoalescingByEventKey:
+    """After removing path-based coalescing, same file_path with different ts
+    creates separate queue entries (keyed by (file_path, ts))."""
+
+    def test_same_path_different_ts_not_coalesced(self):
+        """Two events with same path but different ts both appear in queue."""
+        ts1 = datetime(2024, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
+        ts2 = datetime(2024, 1, 1, 10, 0, 1, tzinfo=timezone.utc)
+        clock = FakeClock()
+        model = DiffQueueModel(
+            AppConfig(min_dwell_seconds=3, max_dwell_seconds=12), now=clock
+        )
+        # First event at ts1 — displayed immediately
+        model.record(_write("/repo/a.py", "v1", ts=ts1))
+        model.tick(clock(), viewport_height=10)  # a.py v1 now on screen
+        # Second event for same path but different ts2
+        model.record(_write("/repo/a.py", "v2-new-content", ts=ts2))
+        # Must be queued (not coalesced into the displayed item)
+        assert model.queued_count() == 1
+
+    def test_pin_with_tuple_key(self):
+        """pin() now accepts a (file_path, ts) tuple key."""
+        clock = FakeClock()
+        model = DiffQueueModel(AppConfig(), now=clock)
+        model.record(_write("/repo/a.py", "hello", ts=TS))
+        key = ("/repo/a.py", TS)
+        result = model.pin(key, clock())
+        assert result is True
+
+    def test_pin_with_unknown_tuple_key_returns_false(self):
+        """pin() with unknown (file_path, ts) tuple returns False."""
+        clock = FakeClock()
+        model = DiffQueueModel(AppConfig(), now=clock)
+        result = model.pin(("/nonexistent.py", TS), clock())
+        assert result is False
+
+    def test_same_key_same_path_same_ts_still_coalesces(self):
+        """Exact same (file_path, ts) key still deduplicates (move-to-front semantics)."""
+        clock = FakeClock()
+        model = DiffQueueModel(
+            AppConfig(min_dwell_seconds=3, max_dwell_seconds=12), now=clock
+        )
+        model.record(_write("/repo/shown.py", "x", ts=TS))
+        model.tick(clock(), viewport_height=10)  # shown.py is current
+        model.record(_write("/repo/a.py", "v1", ts=TS))
+        model.record(_write("/repo/a.py", "v2", ts=TS))  # same key — no new entry
+        # Only one queue entry: same (path, ts) key deduped
+        assert model.queued_count() == 1
 
 
 # ---------------------------------------------------------------------------

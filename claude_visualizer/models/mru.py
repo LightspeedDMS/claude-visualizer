@@ -3,14 +3,24 @@
 This module is deliberately UI-free (no ``textual`` import) so it can be
 unit-tested in isolation and reused by any view.  It consumes
 :class:`~claude_visualizer.events.FileModifiedEvent` instances and maintains a
-newest-first, de-duplicated, capacity-bounded list of files together with the
-origin metadata the panel renders (project tag, short session id, subagent
-flag, last operation).
+newest-arrival-first, event-keyed, capacity-bounded list of file modification
+events together with the origin metadata the panel renders.
 
-Backing store: an ``OrderedDict`` keyed by ``file_path``.  Insertion order is
-oldest → newest, so the *end* of the dict is the most-recent entry.  When the
-same file is touched again we move it to the end (move-to-front semantically),
-and when capacity is exceeded we evict from the front (least-recently-used).
+Backing store: an ``OrderedDict`` keyed by ``(file_path, ts)``.  Insertion
+order is oldest-arrival → newest-arrival, so the *end* of the dict is the
+most-recent entry.  When the same ``(file_path, ts)`` key is seen again we
+move it to the end (move-to-front semantically).  When capacity is exceeded
+we evict from the front (least-recently-arrived).
+
+Each distinct ``(file_path, ts)`` pair is a separate row — the panel is an
+event log, not a file list.  Same file path with different timestamps produces
+separate rows.  ``rows()`` returns entries in newest-arrival-first order
+(insertion order reversed), with NO timestamp sorting.
+
+The old ``highlighted_path`` (``str``) attribute is retained for backward
+compatibility with existing code that has not yet migrated.  New code should
+use ``highlighted_key`` (``tuple | None``) which holds the ``event_key`` of
+the currently-highlighted entry.
 """
 
 from __future__ import annotations
@@ -18,7 +28,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from claude_visualizer.config import AppConfig
 from claude_visualizer.events import FileModifiedEvent, FileOp
@@ -29,10 +39,13 @@ _SHORT_SESSION_LEN = 8
 
 @dataclass(frozen=True)
 class MruEntry:
-    """One row in the MRU panel: a file plus its origin metadata.
+    """One row in the MRU panel: a file modification event plus its origin metadata.
 
     ``ts`` is the event's transcript timestamp (may be ``None`` for an
     un-timestamped event); the panel formats it for display.
+
+    ``event_key`` is the ``(file_path, ts)`` tuple that uniquely identifies
+    this event in the model's backing store.
     """
 
     file_path: str
@@ -42,24 +55,36 @@ class MruEntry:
     op: FileOp
     ts: Optional[datetime] = None
 
+    @property
+    def event_key(self) -> Tuple[str, Optional[datetime]]:
+        """Return the ``(file_path, ts)`` key for this entry."""
+        return (self.file_path, self.ts)
+
 
 class MruModel:
-    """Newest-first, deduplicated, bounded model of recently-modified files."""
+    """Newest-arrival-first, event-keyed, bounded model of file modification events."""
 
     def __init__(self, config: AppConfig) -> None:
         self._config = config
-        # file_path -> MruEntry, ordered oldest (front) → newest (end).
-        self._entries: "OrderedDict[str, MruEntry]" = OrderedDict()
-        # Selected row for the view (story #3 wires keyboard navigation here).
+        # (file_path, ts) -> MruEntry, ordered oldest-arrival (front) → newest-arrival (end).
+        self._entries: "OrderedDict[Tuple[str, Optional[datetime]], MruEntry]" = (
+            OrderedDict()
+        )
+        # Backward-compat: path-based highlight (old callers that haven't migrated).
         self.highlighted_path: Optional[str] = None
+        # New: event-key-based highlight; takes precedence in new code.
+        self.highlighted_key: Optional[Tuple[str, Optional[datetime]]] = None
 
     def record(self, event: FileModifiedEvent) -> MruEntry:
-        """Insert/refresh ``event``'s file at the front; enforce capacity.
+        """Insert ``event`` as a new entry; enforce capacity.
 
-        Dedup is by ``file_path``: a repeat touch moves the file to the front
-        and refreshes its origin fields.  Once the model exceeds
-        ``config.mru_max`` the least-recently-used entry is evicted.
-        Returns the entry that was recorded.
+        The key is ``(event.file_path, event.ts)``.  If that exact key already
+        exists it is moved to the most-recent position (move-to-front) and its
+        origin fields are refreshed.  Same file path with a *different* timestamp
+        is always a separate entry — no dedup across distinct events.
+
+        Once the model exceeds ``config.mru_max`` the least-recently-arrived
+        entry is evicted.  Returns the entry that was recorded.
         """
         entry = MruEntry(
             file_path=event.file_path,
@@ -70,11 +95,13 @@ class MruModel:
             ts=event.ts,
         )
 
-        # Move-to-front: drop any existing entry for this path first so the
-        # re-insertion lands at the end (newest position).
-        if entry.file_path in self._entries:
-            del self._entries[entry.file_path]
-        self._entries[entry.file_path] = entry
+        key = entry.event_key  # (file_path, ts)
+
+        # Move-to-front for the same (path, ts) key: drop existing so re-insertion
+        # lands at the end (newest-arrival position).
+        if key in self._entries:
+            del self._entries[key]
+        self._entries[key] = entry
 
         # LRU fall-off: evict from the front until within capacity.
         while len(self._entries) > self._config.mru_max:
@@ -83,20 +110,11 @@ class MruModel:
         return entry
 
     def rows(self) -> List[MruEntry]:
-        """Return entries newest-first by timestamp as a fresh list (safe to mutate).
+        """Return entries newest-arrival-first as a fresh list (safe to mutate).
 
-        Sorted by ``ts`` descending so the display is chronological regardless
-        of the order the pipeline drained events from multiple sessions.
-        Entries with ``ts=None`` (un-timestamped) sort to the end.
-
-        The sort key is a 2-tuple ``(has_ts, ts)`` — both fields are reversed,
-        so ``True`` (has a timestamp) sorts before ``False`` (no timestamp), and
-        among timestamped entries the latest ``ts`` sorts first.  This avoids
-        any comparison between timezone-aware and timezone-naive datetimes.
+        Order is the reverse of insertion order (newest arrival at index 0).
+        No timestamp sorting is applied — arrival order IS display order.
         """
         entries = list(self._entries.values())
-        entries.sort(
-            key=lambda e: (e.ts is not None, e.ts),
-            reverse=True,
-        )
+        entries.reverse()
         return entries

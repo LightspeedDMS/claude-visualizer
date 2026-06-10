@@ -316,9 +316,9 @@ class VisualizerApp(App):
         try:
             state = self._diff_queue.tick(self._now(), self._diff_viewport_height())
             self._diff_panel().update_from_state(state)
-            # Mirror the displayed file into the MRU highlight (None when
+            # Mirror the displayed event key into the MRU highlight (None when
             # idle/empty clears it); repaint so the highlight follows the queue.
-            self._model.highlighted_path = state.file_path if state else None
+            self._model.highlighted_key = state.event_key if state else None
             self._mru_panel().update_from_model(self._model, self._mru_content_width())
             # Repaint the live Commands feed at the panel's current width (AC5).
             self._commands_panel().update_from_model(
@@ -378,12 +378,12 @@ class VisualizerApp(App):
     def action_pin_current(self) -> None:
         """Pin the diff currently displayed in the Diff panel (keyboard shortcut `p`).
 
-        Keyboard fallback for mouse click: whatever file is currently highlighted
+        Keyboard fallback for mouse click: whatever event is currently highlighted
         in the MRU list (i.e. shown in the Diff panel) is pinned for at least
         min_pin_seconds so the user can read it without it auto-advancing.
         """
-        path = self._model.highlighted_path
-        if path and self._diff_queue.pin(path, self._now()):
+        key = self._model.highlighted_key
+        if key and self._diff_queue.pin(key, self._now()):
             try:
                 state = self._diff_queue.tick(self._now(), self._diff_viewport_height())
                 self._diff_panel().update_from_state(state)
@@ -392,6 +392,22 @@ class VisualizerApp(App):
                 )
             except Exception:
                 pass  # panel gone (unmount race) — ignore
+
+    def on_splitter_handle_splitter_dragged(
+        self, message: SplitterHandle.SplitterDragged
+    ) -> None:
+        """Resize the MRU panel in response to a vertical splitter drag."""
+        self._mru_width = max(_MRU_MIN_WIDTH, self._mru_width + message.delta_x)
+        self.query_one("#mru-panel").styles.width = self._mru_width
+
+    def on_horizontal_separator_separator_dragged(
+        self, message: HorizontalSeparator.SeparatorDragged
+    ) -> None:
+        """Resize the Commands panel in response to a horizontal separator drag."""
+        self._bottom_height = max(
+            _BOTTOM_MIN_HEIGHT, self._bottom_height - message.delta_y
+        )
+        self.query_one("#bottom").styles.height = self._bottom_height
 
     def on_diff_panel_diff_scrolled(self, message: DiffPanel.DiffScrolled) -> None:
         """Scroll the pinned diff by one line per wheel tick.
@@ -405,7 +421,7 @@ class VisualizerApp(App):
         try:
             state = self._diff_queue.tick(self._now(), self._diff_viewport_height())
             self._diff_panel().update_from_state(state)
-            self._model.highlighted_path = state.file_path if state else None
+            self._model.highlighted_key = state.event_key if state else None
             self._mru_panel().update_from_model(self._model, self._mru_content_width())
         except NoMatches:
             pass  # panels gone (unmount race) — ignore
@@ -413,13 +429,13 @@ class VisualizerApp(App):
     def on_mru_files_panel_file_clicked(
         self, message: MruFilesPanel.FileClicked
     ) -> None:
-        """Pin the clicked file in the diff panel for at least min_pin_seconds."""
-        pinned = self._diff_queue.pin(message.file_path, self._now())
+        """Pin the clicked event in the diff panel for at least min_pin_seconds."""
+        pinned = self._diff_queue.pin(message.event_key, self._now())
         if pinned:
             try:
                 state = self._diff_queue.tick(self._now(), self._diff_viewport_height())
                 self._diff_panel().update_from_state(state)
-                self._model.highlighted_path = message.file_path
+                self._model.highlighted_key = message.event_key
                 self._mru_panel().update_from_model(
                     self._model, self._mru_content_width()
                 )

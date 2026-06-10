@@ -510,8 +510,9 @@ class TestMruRowColors:
     def test_highlighted_row_has_no_per_field_colors(self):
         """Highlighted rows use bold reverse — no per-field color spans."""
         model = _mru_model_with_entry(project_tag="hlproject")
-        # Set highlighted_path to trigger highlighted rendering
-        model.highlighted_path = "/some/path/widget.py"
+        # Set highlighted_key to trigger highlighted rendering
+        entry = model.rows()[0]
+        model.highlighted_key = entry.event_key
         text = render_mru(model, 0, 0)
         # For the highlighted row, per-field color spans must NOT be present.
         # The only span covering the project tag should be the bold-reverse style.

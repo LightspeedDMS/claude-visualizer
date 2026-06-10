@@ -1,17 +1,17 @@
 """FIFO display-queue state machine for the Live Diff panel (story #3).
 
 This module is pure and UI-free (no ``textual`` import): it owns ALL of the
-diff panel's timing, scrolling, coalescing, overflow and idle behaviour, and
-exposes a single :meth:`DiffQueueModel.tick` that returns an immutable
+diff panel's timing, scrolling, overflow and idle behaviour, and exposes a
+single :meth:`DiffQueueModel.tick` that returns an immutable
 :class:`DisplayState` snapshot for the UI to render.  Time is injected as a
 ``now: Callable[[], float]`` so the whole state machine is deterministic under
 test (a fake clock) with no real sleeps.
 
 Behaviour (acceptance criteria from issue #3):
 
-- **Coalesce by file (AC5).**  Re-recording a file that is currently shown, or
-  still queued, updates that file's event IN PLACE and keeps its queue
-  position — it is never re-appended to the back.
+- **No coalescing (updated).**  Each ``(file_path, ts)`` pair is a separate
+  queue entry — same file with different timestamps is always a new entry.
+  Exact same ``(file_path, ts)`` key still deduplicates (move-to-front).
 - **Bounded dwell + auto-scroll (AC6).**  The current diff dwells at least
   ``min_dwell_seconds`` and at most ``max_dwell_seconds``; its scroll offset
   advances from 0 to the bottom across ``[0, max_dwell]`` so a tall diff visibly
@@ -30,7 +30,7 @@ import math
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from claude_visualizer.config import AppConfig
 from claude_visualizer.diffing import DiffSegment, compute_diff
@@ -38,6 +38,9 @@ from claude_visualizer.events import FileModifiedEvent, FileOp
 
 # Number of leading session-id characters kept for the compact origin tag.
 _SHORT_SESSION_LEN = 8
+
+# Type alias for event keys: (file_path, ts) tuple.
+EventKey = Tuple[str, Optional[datetime]]
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,10 @@ class DisplayState:
     from ``model``/``used_thinking``/``file_path``/origin/``ts``, and a ``+N more``
     badge when ``plus_n_more`` is non-zero.  ``ts`` is the displayed event's
     transcript timestamp (may be ``None``); the header formats it for display.
+
+    ``event_key`` is the ``(file_path, ts)`` tuple identifying this event — the
+    same key used by the MRU model and diff queue's internal stores.  ``None``
+    in the pre-activity empty state.
     """
 
     file_path: Optional[str]
@@ -65,26 +72,28 @@ class DisplayState:
     is_idle: bool
     ts: Optional[datetime] = None
     is_pinned: bool = False
+    event_key: Optional[EventKey] = None
 
 
 @dataclass
 class _Item:
-    """A queued/displayed file plus its latest event (mutable for coalescing)."""
+    """A queued/displayed file plus its event (keyed by (file_path, ts))."""
 
     file_path: str
     event: FileModifiedEvent
 
 
 class DiffQueueModel:
-    """FIFO, coalesced-by-file display queue with dwell/scroll/idle/overflow."""
+    """FIFO, event-keyed display queue with dwell/scroll/idle/overflow."""
 
     def __init__(self, config: AppConfig, now: Callable[[], float]) -> None:
         self._config = config
         self._now = now
         # Pending UNSEEN files, FIFO: front (first) is the stalest, back is the
-        # most recently arrived.  Keyed by path so coalescing is O(1).
-        self._queue: "OrderedDict[str, _Item]" = OrderedDict()
-        # The file currently being displayed (None until the first tick).
+        # most recently arrived.  Keyed by (file_path, ts) so same-key events
+        # are deduplicated (move-to-front); different ts = different entry.
+        self._queue: "OrderedDict[EventKey, _Item]" = OrderedDict()
+        # The item currently being displayed (None until the first tick).
         self._current: Optional[_Item] = None
         # Clock value at which the current item began displaying (dwell anchor).
         self._current_started_at: float = 0.0
@@ -92,14 +101,15 @@ class DiffQueueModel:
         # ``+N more`` indicator so a drop is never silent (AC8).
         self._overflow_dropped: int = 0
 
-        # Per-file event cache used to rebuild any file's diff on pin.
-        # Updated in record() so any file the user can see in the MRU can be
-        # pinned even after the diff queue has already advanced past it.
-        self._event_by_path: OrderedDict = OrderedDict()
+        # Per-event cache used to rebuild any event's diff on pin.
+        # Keyed by (file_path, ts) tuple — updated in record() so any event
+        # the user can see in the MRU can be pinned even after the diff queue
+        # has already advanced past it.
+        self._event_by_key: "OrderedDict[EventKey, FileModifiedEvent]" = OrderedDict()
 
         # Pin state set by pin(); cleared by tick() when both expiry and
         # new-event conditions are met.
-        self._pinned_path: Optional[str] = None
+        self._pinned_key: Optional[EventKey] = None
         self._pin_time: float = 0.0
         self._new_event_since_pin: bool = False
         # Manual scroll offset within the pinned diff (mouse-wheel scroll).
@@ -109,35 +119,48 @@ class DiffQueueModel:
     # -- introspection (tests) --------------------------------------------
 
     def queued_count(self) -> int:
-        """Number of pending UNSEEN files (excludes the displayed one)."""
+        """Number of pending UNSEEN items (excludes the displayed one)."""
         return len(self._queue)
 
     # -- recording ---------------------------------------------------------
 
     def record(self, event: FileModifiedEvent) -> None:
-        """Record a file modification, coalescing by path (AC5).
+        """Record a file modification event, keyed by (file_path, ts).
 
-        - If the file is the one on screen → refresh its event in place (the
-          resting/idle diff updates without changing position).
-        - If the file is already queued → refresh its event in place and KEEP
-          its queue position (do not re-append).
-        - Otherwise append it to the back of the FIFO; if that exceeds
-          ``diff_queue_max`` drop the stalest UNSEEN front entry (AC8).
+        The key is ``(event.file_path, event.ts)``.  If that exact key already
+        exists in the queue it is moved to the back (most-recent position) and
+        its event is refreshed.  Different timestamps for the same file path
+        are always separate entries — no path-based coalescing.
+
+        On overflow the stalest UNSEEN front entry is dropped (AC8).
         """
-        self._event_by_path[event.file_path] = event
-        self._event_by_path.move_to_end(event.file_path)
-        while len(self._event_by_path) > self._config.cache_max_file_events:
-            self._event_by_path.popitem(last=False)
-        if self._pinned_path is not None:
+        key: EventKey = (event.file_path, event.ts)
+
+        # Update the per-event pin cache (bounded LRU).
+        self._event_by_key[key] = event
+        self._event_by_key.move_to_end(key)
+        while len(self._event_by_key) > self._config.cache_max_file_events:
+            self._event_by_key.popitem(last=False)
+
+        if self._pinned_key is not None:
             self._new_event_since_pin = True
-        path = event.file_path
-        if self._current is not None and self._current.file_path == path:
+
+        # If the current displayed item has exactly this key, refresh it.
+        if (
+            self._current is not None
+            and self._current.file_path == event.file_path
+            and self._current.event.ts == event.ts
+        ):
             self._current.event = event
             return
-        if path in self._queue:
-            self._queue[path].event = event  # in place; position preserved
+
+        # Move-to-back in the FIFO queue for the same key (dedup, keep recency).
+        if key in self._queue:
+            self._queue[key].event = event
+            self._queue.move_to_end(key)
             return
-        self._queue[path] = _Item(file_path=path, event=event)
+
+        self._queue[key] = _Item(file_path=event.file_path, event=event)
         self._enforce_cap()
 
     def _enforce_cap(self) -> None:
@@ -147,11 +170,16 @@ class DiffQueueModel:
             self._queue.popitem(last=False)  # FIFO front = stalest unseen
             self._overflow_dropped += 1
 
-    def pin(self, path: str, now: float) -> bool:
-        """Pin ``path`` for display, bypassing the normal queue (returns False if unknown)."""
-        if path not in self._event_by_path:
+    def pin(self, key: EventKey, now: float) -> bool:
+        """Pin the event identified by ``key`` for display (returns False if unknown).
+
+        ``key`` is a ``(file_path, ts)`` tuple matching an event previously
+        passed to :meth:`record`.  Returns ``False`` if the key is not in the
+        event cache (event was never seen or was evicted).
+        """
+        if key not in self._event_by_key:
             return False
-        self._pinned_path = path
+        self._pinned_key = key
         self._pin_time = now
         self._new_event_since_pin = False
         self._pin_scroll = 0
@@ -163,9 +191,9 @@ class DiffQueueModel:
         No-op when not pinned.  Clamps to [0, max_scroll] where
         max_scroll = len(segments) - viewport_height.
         """
-        if self._pinned_path is None:
+        if self._pinned_key is None:
             return
-        event = self._event_by_path.get(self._pinned_path)
+        event = self._event_by_key.get(self._pinned_key)
         if event is None:
             return
         segments = compute_diff(event, self._config)
@@ -173,17 +201,17 @@ class DiffQueueModel:
         self._pin_scroll = max(0, min(self._pin_scroll + delta, max_scroll))
 
     def fast_forward_to_latest(self, now: float) -> None:
-        """Skip cache-replay animation: rest immediately on the most-recent file.
+        """Skip cache-replay animation: rest immediately on the most-recent item.
 
         Discards all pending queue entries and places the newest item directly
         into the display slot so the very first tick shows the latest file as
         idle rather than animating through every replayed entry in order.
-        ``_event_by_path`` is deliberately left intact so any replayed file can
+        ``_event_by_key`` is deliberately left intact so any replayed file can
         still be pinned via click or keyboard.
         """
         if not self._queue:
             return
-        last_path, last_item = self._queue.popitem(last=True)
+        last_key, last_item = self._queue.popitem(last=True)
         self._queue.clear()
         self._current = last_item
         self._current_started_at = now
@@ -197,25 +225,25 @@ class DiffQueueModel:
         empty; otherwise it always returns a populated state (resting on the
         latest file when idle — never blank).
         """
-        if self._pinned_path is not None:
+        if self._pinned_key is not None:
             elapsed_pin = now - self._pin_time
             expired = elapsed_pin >= self._config.min_pin_seconds
             if expired and self._new_event_since_pin:
                 # Conditions met: release pin.  Reset dwell anchor so the
                 # resumed queue item gets a fresh window, not a stale one.
-                self._pinned_path = None
+                self._pinned_key = None
                 self._pin_scroll = 0
                 self._current_started_at = now
                 # Fall through to normal queue logic below.
             else:
                 # Still pinned: build state from cached event.
-                event = self._event_by_path.get(self._pinned_path)
+                event = self._event_by_key.get(self._pinned_key)
                 if event is not None:
                     segments = compute_diff(event, self._config)
                     window = max(1, viewport_height)
                     visible = segments[self._pin_scroll : self._pin_scroll + window]
                     return DisplayState(
-                        file_path=self._pinned_path,
+                        file_path=self._pinned_key[0],
                         segments=segments,
                         visible_segments=visible,
                         scroll_offset=self._pin_scroll,
@@ -229,13 +257,14 @@ class DiffQueueModel:
                         is_idle=False,
                         ts=event.ts,
                         is_pinned=True,
+                        event_key=self._pinned_key,
                     )
                 else:
-                    # Pinned file vanished from cache — clear and fall through.
-                    self._pinned_path = None
+                    # Pinned event vanished from cache — clear and fall through.
+                    self._pinned_key = None
                     self._pin_scroll = 0
 
-        # Promote the first file the moment anything is queued.  A FRESHLY
+        # Promote the first item the moment anything is queued.  A FRESHLY
         # promoted diff is rendered for this frame and only becomes eligible to
         # advance on a LATER tick (a strictly greater clock value) — otherwise,
         # with min_dwell == 0, an item could be promoted and advanced past in
@@ -299,14 +328,14 @@ class DiffQueueModel:
 
     def _promote_next(self, now: float) -> None:
         """Move the front of the FIFO into the display slot, anchoring dwell."""
-        path, item = self._queue.popitem(last=False)
+        key, item = self._queue.popitem(last=False)
         self._current = item
         self._current_started_at = now
 
     # -- state construction ------------------------------------------------
 
     def _plus_n_more(self) -> int:
-        """Pending UNSEEN files plus overflow drops → the ``+N more`` count."""
+        """Pending UNSEEN items plus overflow drops → the ``+N more`` count."""
         return len(self._queue) + self._overflow_dropped
 
     def _empty_state(self) -> DisplayState:
@@ -325,6 +354,7 @@ class DiffQueueModel:
             plus_n_more=self._plus_n_more(),
             is_idle=True,
             ts=None,
+            event_key=None,
         )
 
     def _build_state(
@@ -352,4 +382,5 @@ class DiffQueueModel:
             plus_n_more=self._plus_n_more(),
             is_idle=not self._queue,
             ts=evt.ts,
+            event_key=(self._current.file_path, evt.ts),
         )
