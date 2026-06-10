@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-visualizer"
-version = "0.2.0"
+version = "0.3.0"
 description = "Blocking full-screen TUI for live cross-session Claude Code activity"
 requires-python = ">=3.11"
 dependencies = [

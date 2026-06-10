@@ -13,7 +13,7 @@ Two layers, mirroring the MRU panel's split:
    harness drives it end-to-end in ``test_ui.py``).
 
 ACs exercised here:
-- AC2  Write → labelled whole-file additions (header marker + all-green body).
+- AC2  Write → all-green additions, no fabricated before-state (no DEL, no header label).
 - AC3  Header: short model label · 🧠 (iff used_thinking) · filename · origin
        (project · short session, ⤷sub when subagent).
 - AC8  ``+N more`` badge when ``plus_n_more`` > 0.
@@ -30,7 +30,6 @@ from rich.text import Text
 from claude_visualizer.config import AppConfig
 from claude_visualizer.diffing import (
     COLOR_FOR_KIND,
-    WHOLE_FILE_WRITE_LABEL,
     DiffKind,
     DiffSegment,
 )
@@ -213,25 +212,19 @@ class TestRenderDiffBody:
         body = render_diff_body(_state(visible_segments=[seg]))
         assert COLOR_FOR_KIND[DiffKind.CONTEXT] in _span_styles(body)  # "dim"
 
-    def test_write_whole_file_label_and_additions(self):
-        # AC2: a Write renders the whole-file marker header + all-green adds.
-        header = DiffSegment(DiffKind.HEADER, f"{WHOLE_FILE_WRITE_LABEL}: /r/x.py")
+    def test_write_whole_file_additions(self):
+        # AC2: a Write renders all-green additions; HEADER segments still render when present.
+        header = DiffSegment(DiffKind.HEADER, "whole-file write: /r/x.py")
         body = DiffSegment(DiffKind.ADD, "+ print('hi')")
         text = _plain(
             render_diff_body(_state(op=FileOp.WRITE, visible_segments=[header, body]))
         )
-        assert WHOLE_FILE_WRITE_LABEL in text
+        assert "whole-file write" in text
         assert "+ print('hi')" in text
 
-    def test_plus_n_more_badge_when_pending(self):
-        # AC8: pending/overflowed files surface as a "+N more" badge.
+    def test_plus_n_more_badge_not_rendered(self):
         seg = DiffSegment(DiffKind.ADD, "+ a")
         text = _plain(render_diff_body(_state(visible_segments=[seg], plus_n_more=4)))
-        assert "+4 more" in text
-
-    def test_no_badge_when_nothing_pending(self):
-        seg = DiffSegment(DiffKind.ADD, "+ a")
-        text = _plain(render_diff_body(_state(visible_segments=[seg], plus_n_more=0)))
         assert "more" not in text
 
     def test_truncation_footer_rendered(self):

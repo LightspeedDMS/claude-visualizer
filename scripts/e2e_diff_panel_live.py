@@ -182,8 +182,6 @@ async def run(screenshot_path: Path) -> None:
             ))
             text = await _pump_diff(pilot, "brand_new.py", clock)
             wstyles = _span_styles(diff)
-            _check("whole-file write" in text, "AC2 whole-file write label",
-                   repr("whole-file write"))
             _check("+ import os" in text, "AC2 first addition", repr("+ import os"))
             _check("+ print(os.getcwd())" in text, "AC2 second addition",
                    repr("+ print(os.getcwd())"))

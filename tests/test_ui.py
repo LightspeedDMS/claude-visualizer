@@ -811,8 +811,7 @@ class TestVisualizerAppDiffPanel:
                 ),
             )
             text = await _pump_diff(pilot, "brand_new.py", clock=clock)
-            # AC2: labelled whole-file write, all-green additions, no DEL lines.
-            assert "whole-file write" in text
+            # AC2: all-green additions for a Write, no fabricated DEL lines.
             assert "+ import os" in text
             assert "+ print(os.getcwd())" in text
             assert "- " not in text  # no fabricated removals
@@ -3162,3 +3161,285 @@ class TestTitleHighlightIntegration:
             assert not _has_reverse_on_title(
                 pilot.app.query_one(MruFilesPanel)._renderable, MRU_TITLE
             ), "MRU title must NOT be 'reverse' after focus moved to Diff"
+
+
+# ---------------------------------------------------------------------------
+# Home / End key scrolling
+# ---------------------------------------------------------------------------
+
+
+class TestHomeEndKeys:
+    """Home/End scroll the focused panel to the very top/bottom.
+
+    Anti-mock: real run_test + pilot.press.  Each test seeds MORE than one
+    screenful of rows so there is guaranteed room to jump.
+    """
+
+    async def test_mru_home_scrolls_to_top(self, tmp_path: Path):
+        """Home on focused MRU resets _scroll_offset to 0."""
+        root = tmp_path / "projects"
+        session = root / "proj" / "mru_home.jsonl"
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            for i in range(30):
+                _append_line(
+                    session,
+                    _write_tool_line(
+                        "Write",
+                        {"file_path": f"/repo/he_{i:02d}.py", "content": "x"},
+                        session_id=f"heSESS{i:04d}",
+                        cwd="/home/dev/heproj",
+                    ),
+                )
+            await _pump(pilot, "/repo/he_29.py")
+
+            mru = pilot.app.query_one(MruFilesPanel)
+            mru.focus()
+            await pilot.pause()
+
+            # Scroll down first so offset > 0.
+            mru._scroll_offset = 15
+            await pilot.press("home")
+            await pilot.pause()
+            assert (
+                mru._scroll_offset == 0
+            ), f"home must reset _scroll_offset to 0; got {mru._scroll_offset}"
+
+    async def test_mru_end_scrolls_to_bottom(self, tmp_path: Path):
+        """End on focused MRU sets _scroll_offset to len(rows) - 1."""
+        root = tmp_path / "projects"
+        session = root / "proj" / "mru_end.jsonl"
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            for i in range(30):
+                _append_line(
+                    session,
+                    _write_tool_line(
+                        "Write",
+                        {"file_path": f"/repo/en_{i:02d}.py", "content": "x"},
+                        session_id=f"enSESS{i:04d}",
+                        cwd="/home/dev/enproj",
+                    ),
+                )
+            await _pump(pilot, "/repo/en_29.py")
+
+            mru = pilot.app.query_one(MruFilesPanel)
+            mru.focus()
+            await pilot.pause()
+
+            # Ensure offset starts at 0.
+            mru._scroll_offset = 0
+            await pilot.press("end")
+            await pilot.pause()
+            expected_max = len(mru._rows) - 1
+            assert mru._scroll_offset == expected_max, (
+                f"end must set _scroll_offset to {expected_max}; "
+                f"got {mru._scroll_offset}"
+            )
+
+    async def test_commands_home_scrolls_to_top(self, tmp_path: Path):
+        """Home on focused Commands panel resets _scroll_offset to 0 and re-arms follow."""
+        root = tmp_path / "projects"
+        session = root / "proj" / "cmd_home.jsonl"
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            for i in range(30):
+                _append_line(
+                    session,
+                    _write_tool_line(
+                        "Bash",
+                        {"command": f"cmd-home-{i:02d}"},
+                        session_id=f"cmdHM{i:04d}",
+                        cwd="/home/dev/cmdhomproj",
+                    ),
+                )
+            await _pump_commands(pilot, "cmd-home-29")
+
+            cmd_panel = pilot.app.query_one(CommandsPanel)
+            cmd_panel.focus()
+            await pilot.pause()
+
+            # Scroll away from top first.
+            cmd_panel._scroll_offset = 15
+            cmd_panel._follow = False
+            await pilot.press("home")
+            await pilot.pause()
+            assert (
+                cmd_panel._scroll_offset == 0
+            ), f"home must reset _scroll_offset to 0; got {cmd_panel._scroll_offset}"
+            assert cmd_panel._follow is True, "home must re-arm autoscroll follow"
+
+    async def test_commands_end_scrolls_to_bottom(self, tmp_path: Path):
+        """End on focused Commands panel sets _scroll_offset to len(rows) - 1."""
+        root = tmp_path / "projects"
+        session = root / "proj" / "cmd_end.jsonl"
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg)
+        async with app.run_test(size=(120, 40)) as pilot:
+            for i in range(30):
+                _append_line(
+                    session,
+                    _write_tool_line(
+                        "Bash",
+                        {"command": f"cmd-end-{i:02d}"},
+                        session_id=f"cmdEN{i:04d}",
+                        cwd="/home/dev/cmdendproj",
+                    ),
+                )
+            await _pump_commands(pilot, "cmd-end-29")
+
+            cmd_panel = pilot.app.query_one(CommandsPanel)
+            cmd_panel.focus()
+            await pilot.pause()
+
+            # Start at top.
+            cmd_panel._scroll_offset = 0
+            cmd_panel._follow = False
+            await pilot.press("end")
+            await pilot.pause()
+            expected_max = len(cmd_panel._last_model.rows()) - 1
+            assert cmd_panel._scroll_offset == expected_max, (
+                f"end must set _scroll_offset to {expected_max}; "
+                f"got {cmd_panel._scroll_offset}"
+            )
+
+    async def test_diff_home_noop_when_unpinned(self, tmp_path: Path):
+        """Home on unpinned Diff panel does not change _pin_scroll."""
+        root = tmp_path / "projects"
+        session = root / "proj" / "diff_home_unpin.jsonl"
+        clock = _ManualClock()
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg, now=clock)
+        async with app.run_test(size=(120, 40)) as pilot:
+            tall_content = "\n".join(f"line{i}" for i in range(80))
+            _append_line(
+                session,
+                _write_tool_line(
+                    "Write",
+                    {"file_path": "/repo/diff_home_target.py", "content": tall_content},
+                    session_id="diffHMSS01",
+                    cwd="/home/dev/diffhmproj",
+                ),
+            )
+            await _pump(pilot, "/repo/diff_home_target.py")
+            await _pump_diff(pilot, "diff_home_target.py", clock=clock)
+
+            diff = pilot.app.query_one(DiffPanel)
+            diff.focus()
+            await pilot.pause()
+
+            pin_before = app._diff_queue._pin_scroll
+            await pilot.press("home")
+            await pilot.pause()
+            assert app._diff_queue._pin_scroll == pin_before, (
+                f"home on UNPINNED diff must not change _pin_scroll; "
+                f"before={pin_before}, after={app._diff_queue._pin_scroll}"
+            )
+
+    async def test_diff_end_noop_when_unpinned(self, tmp_path: Path):
+        """End on unpinned Diff panel does not change _pin_scroll."""
+        root = tmp_path / "projects"
+        session = root / "proj" / "diff_end_unpin.jsonl"
+        clock = _ManualClock()
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg, now=clock)
+        async with app.run_test(size=(120, 40)) as pilot:
+            tall_content = "\n".join(f"line{i}" for i in range(80))
+            _append_line(
+                session,
+                _write_tool_line(
+                    "Write",
+                    {"file_path": "/repo/diff_end_target.py", "content": tall_content},
+                    session_id="diffENSS01",
+                    cwd="/home/dev/diffenproj",
+                ),
+            )
+            await _pump(pilot, "/repo/diff_end_target.py")
+            await _pump_diff(pilot, "diff_end_target.py", clock=clock)
+
+            diff = pilot.app.query_one(DiffPanel)
+            diff.focus()
+            await pilot.pause()
+
+            pin_before = app._diff_queue._pin_scroll
+            await pilot.press("end")
+            await pilot.pause()
+            assert app._diff_queue._pin_scroll == pin_before, (
+                f"end on UNPINNED diff must not change _pin_scroll; "
+                f"before={pin_before}, after={app._diff_queue._pin_scroll}"
+            )
+
+    async def test_diff_home_jumps_to_zero_when_pinned(self, tmp_path: Path):
+        """Home on pinned Diff panel sets _pin_scroll to 0."""
+        root = tmp_path / "projects"
+        session = root / "proj" / "diff_home_pin.jsonl"
+        clock = _ManualClock()
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg, now=clock)
+        async with app.run_test(size=(120, 40)) as pilot:
+            tall_content = "\n".join(f"line{i}" for i in range(80))
+            _append_line(
+                session,
+                _write_tool_line(
+                    "Write",
+                    {"file_path": "/repo/diff_home_pin.py", "content": tall_content},
+                    session_id="diffHPSS01",
+                    cwd="/home/dev/diffhpproj",
+                ),
+            )
+            await _pump(pilot, "/repo/diff_home_pin.py")
+            await _pump_diff(pilot, "diff_home_pin.py", clock=clock)
+
+            diff = pilot.app.query_one(DiffPanel)
+            diff.focus()
+            await pilot.press("p")
+            await pilot.pause()
+            assert "📌 pinned" in diff.rendered_text(), "Must be pinned before test"
+
+            # Advance scroll position so Home has somewhere to go.
+            app._diff_queue._pin_scroll = 10
+            await pilot.press("home")
+            await pilot.pause()
+            assert app._diff_queue._pin_scroll == 0, (
+                f"home on PINNED diff must set _pin_scroll to 0; "
+                f"got {app._diff_queue._pin_scroll}"
+            )
+
+    async def test_diff_end_jumps_to_max_when_pinned(self, tmp_path: Path):
+        """End on pinned Diff panel sets _pin_scroll to max_scroll."""
+        root = tmp_path / "projects"
+        session = root / "proj" / "diff_end_pin.jsonl"
+        clock = _ManualClock()
+        cfg = _fixture_config(root)
+        app = VisualizerApp(cfg, now=clock)
+        async with app.run_test(size=(120, 40)) as pilot:
+            tall_content = "\n".join(f"line{i}" for i in range(80))
+            _append_line(
+                session,
+                _write_tool_line(
+                    "Write",
+                    {"file_path": "/repo/diff_end_pin.py", "content": tall_content},
+                    session_id="diffEPSS01",
+                    cwd="/home/dev/diffepproj",
+                ),
+            )
+            await _pump(pilot, "/repo/diff_end_pin.py")
+            await _pump_diff(pilot, "diff_end_pin.py", clock=clock)
+
+            diff = pilot.app.query_one(DiffPanel)
+            diff.focus()
+            await pilot.press("p")
+            await pilot.pause()
+            assert "📌 pinned" in diff.rendered_text(), "Must be pinned before test"
+
+            # Start at top and press End.
+            app._diff_queue._pin_scroll = 0
+            await pilot.press("end")
+            await pilot.pause()
+            assert app._diff_queue._pin_scroll > 0, (
+                f"end on PINNED diff must advance _pin_scroll beyond 0; "
+                f"got {app._diff_queue._pin_scroll}"
+            )

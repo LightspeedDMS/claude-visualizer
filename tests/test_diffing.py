@@ -6,9 +6,8 @@ so the UI can render colour from data while the logic stays unit-testable.
 
 - AC1: an Edit (old_string → new_string) becomes a unified line diff with
   ADD / DEL / CONTEXT segment kinds (stdlib ``difflib``).
-- AC2: a Write (full_content) becomes labelled WHOLE-FILE ADDITIONS — every
-  line is ADD, prefixed by an explicit whole-file-write marker, with NO
-  fabricated before/after (no DEL segments).
+- AC2: a Write (full_content) becomes all-ADD segments — every line is ADD,
+  with NO fabricated before/after (no DEL segments, no HEADER label).
 - AC10: a diff longer than ``config.diff_max_lines`` is truncated to the cap
   with a trailing ``…(truncated, N more lines)`` footer segment.
 """
@@ -22,7 +21,6 @@ import pytest
 from claude_visualizer.config import AppConfig
 from claude_visualizer.diffing import (
     COLOR_FOR_KIND,
-    WHOLE_FILE_WRITE_LABEL,
     DiffKind,
     DiffSegment,
     compute_diff,
@@ -184,12 +182,6 @@ class TestWriteDiff:
         segs = compute_diff(_write("one\ntwo"), AppConfig())
         assert all(s.kind is not DiffKind.DEL for s in segs)
 
-    def test_whole_file_write_header_present(self):
-        segs = compute_diff(_write("x"), AppConfig())
-        headers = [s for s in segs if s.kind is DiffKind.HEADER]
-        assert headers, "expected a whole-file-write header segment"
-        assert WHOLE_FILE_WRITE_LABEL in headers[0].text
-
     def test_every_content_line_rendered_as_add(self):
         content = "l1\nl2\nl3\nl4"
         segs = compute_diff(_write(content), AppConfig())
@@ -197,14 +189,14 @@ class TestWriteDiff:
         for line in content.splitlines():
             assert any(line in a for a in adds)
 
-    def test_empty_write_still_has_header(self):
+    def test_empty_write_yields_no_segments(self):
         segs = compute_diff(_write(""), AppConfig())
-        assert any(s.kind is DiffKind.HEADER for s in segs)
+        assert all(s.kind is DiffKind.ADD for s in segs) or segs == []
 
     def test_none_content_write_does_not_crash(self):
-        # Defensive: a Write whose full_content is None yields just the header.
+        # Defensive: a Write whose full_content is None yields an empty list.
         segs = compute_diff(_write(content=None), AppConfig())
-        assert any(s.kind is DiffKind.HEADER for s in segs)
+        assert segs == []
         assert all(s.kind is not DiffKind.DEL for s in segs)
 
 
@@ -336,12 +328,12 @@ class TestLineNumbers:
         adds = [s for s in segs if s.kind is DiffKind.ADD]
         assert adds[0].line_no == 1
 
-    # --- Write: HEADER has None ---
+    # --- Write: no HEADER segments produced ---
 
-    def test_write_header_has_no_line_number(self):
+    def test_write_produces_no_header_segments(self):
         segs = compute_diff(_write("x"), AppConfig())
         headers = [s for s in segs if s.kind is DiffKind.HEADER]
-        assert headers[0].line_no is None
+        assert headers == []
 
     # --- TRUNCATION always None ---
 

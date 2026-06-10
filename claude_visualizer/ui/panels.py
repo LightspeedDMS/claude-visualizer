@@ -104,6 +104,11 @@ DIFF_DEFAULT_VIEWPORT = 20
 # content height gives the approximate number of data rows visible at once.
 _PANEL_TITLE_CHROME = 2
 
+# Large delta used for Home/End key scrolling — intentionally larger than any
+# realistic list so that clamping in _scroll_mru/_scroll_commands always lands
+# at the true start (0) or end (len-1) regardless of current content length.
+_SCROLL_TO_EXTREME = 999_999
+
 # --- Commands feed (story #4) ---------------------------------------------
 # Header line for the bottom Commands feed panel.
 COMMANDS_TITLE = "Commands — live cross-session Bash & MCP feed"
@@ -394,6 +399,14 @@ class MruFilesPanel(Static):
             self._scroll_mru(-self._page_step())
             self._select_at_offset()
             event.stop()
+        elif event.key == "home":
+            self._scroll_mru(-_SCROLL_TO_EXTREME)
+            self._select_at_offset()
+            event.stop()
+        elif event.key == "end":
+            self._scroll_mru(_SCROLL_TO_EXTREME)
+            self._select_at_offset()
+            event.stop()
 
     def on_mouse_down(self, event) -> None:
         """Map mouse-down Y → MRU row, accounting for wrapped long rows.
@@ -521,10 +534,6 @@ def render_diff_body(state: DisplayState) -> Text:
         body.append(segment.text, style=style)
         if index < len(segments) - 1:
             body.append("\n")
-    if state.plus_n_more > 0:
-        if segments:
-            body.append("\n")
-        body.append(f"+{state.plus_n_more} more", style="bold yellow")
     return body
 
 
@@ -637,6 +646,12 @@ class DiffPanel(Static):
             event.stop()
         elif event.key == "pageup":
             self.post_message(self.DiffScrolled(-self._page_step()))
+            event.stop()
+        elif event.key == "home":
+            self.post_message(self.DiffScrolled(-_SCROLL_TO_EXTREME))
+            event.stop()
+        elif event.key == "end":
+            self.post_message(self.DiffScrolled(_SCROLL_TO_EXTREME))
             event.stop()
 
     def render(self) -> Text:
@@ -905,6 +920,12 @@ class CommandsPanel(Static):
             event.stop()
         elif event.key == "pageup":
             self._scroll_commands(-self._page_step())
+            event.stop()
+        elif event.key == "home":
+            self._scroll_commands(-_SCROLL_TO_EXTREME)
+            event.stop()
+        elif event.key == "end":
+            self._scroll_commands(_SCROLL_TO_EXTREME)
             event.stop()
 
     def render(self) -> Text:

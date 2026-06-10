@@ -7,6 +7,19 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.0] — 2026-06-09
+
+### Added
+
+- Home/End keyboard navigation in all three panels (MRU, Diff, Commands) — jumps to the first or last item when the panel is focused.
+
+### Removed
+
+- Removed the `whole-file write: <path>` header line from Write diffs — the diff panel now shows only the green additions without the redundant label.
+- Removed the `+N more` overflow badge from the diff panel.
+
+---
+
 ## [0.2.0] — 2026-06-05
 
 ### Added

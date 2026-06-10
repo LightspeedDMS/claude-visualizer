@@ -11,11 +11,10 @@ Two shapes, per the read-only constraint:
 - **Edit** (``old_string`` → ``new_string``): a line diff computed with stdlib
   :class:`difflib.SequenceMatcher`.  Equal lines → ``CONTEXT`` (dim), removed
   lines → ``DEL`` (red), added lines → ``ADD`` (green).  (AC1)
-- **Write** (``full_content``): rendered as labelled WHOLE-FILE ADDITIONS —
-  a single ``HEADER`` marker followed by one ``ADD`` per line.  There is NO
-  fabricated before/after, because a read-only tail cannot know the prior
-  on-disk content (so a Write is honestly "all new", never a synthetic diff).
-  (AC2)
+- **Write** (``full_content``): rendered as all-ADD body, one ``ADD`` per line.
+  There is NO fabricated before/after, because a read-only tail cannot know
+  the prior on-disk content (so a Write is honestly "all new", never a
+  synthetic diff).  (AC2)
 
 The combined body is capped at ``config.diff_max_lines``; the overflow is
 replaced by one trailing ``TRUNCATION`` footer naming how many lines were
@@ -52,10 +51,6 @@ COLOR_FOR_KIND = {
     DiffKind.HEADER: "bold cyan",
     DiffKind.TRUNCATION: "dim",
 }
-
-# Marker text that flags a Write rendering as whole-file additions (so the
-# viewer never mistakes all-green output for a real before/after diff).
-WHOLE_FILE_WRITE_LABEL = "whole-file write"
 
 
 @dataclass(frozen=True)
@@ -107,16 +102,11 @@ def _edit_segments(event: FileModifiedEvent) -> List[DiffSegment]:
 
 
 def _write_segments(event: FileModifiedEvent) -> List[DiffSegment]:
-    """Render a Write as a labelled header + all-ADD body, no DEL (AC2)."""
-    header = DiffSegment(
-        DiffKind.HEADER,
-        f"{WHOLE_FILE_WRITE_LABEL}: {event.file_path}",
-    )
-    body = [
+    """Render a Write as all-ADD body, no DEL (AC2)."""
+    return [
         DiffSegment(DiffKind.ADD, f"+ {line}", line_no=i + 1)
         for i, line in enumerate(_split_lines(event.full_content))
     ]
-    return [header, *body]
 
 
 def _is_body(kind: DiffKind) -> bool:
@@ -155,8 +145,8 @@ def _truncate(segments: List[DiffSegment], max_lines: int) -> List[DiffSegment]:
 def compute_diff(event: FileModifiedEvent, config: AppConfig) -> List[DiffSegment]:
     """Compute the structured, colour-tagged diff for ``event``.
 
-    Edit → unified line diff (ADD/DEL/CONTEXT); Write → labelled whole-file
-    additions (HEADER + ADD only).  The body is truncated to
+    Edit → unified line diff (ADD/DEL/CONTEXT); Write → all-ADD lines only
+    (no fabricated before-state, no HEADER).  The body is truncated to
     ``config.diff_max_lines`` with a trailing footer when it overflows.
     """
     if event.op == FileOp.WRITE:
