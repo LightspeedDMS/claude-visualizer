@@ -994,6 +994,59 @@ class TestMissingRrddataFields:
         finally:
             server.shutdown()
 
+    def test_null_last_entry_falls_back_to_prior_entry(self, tmp_path: Path) -> None:
+        """When rrd[-1] has null netin/netout (current period not consolidated),
+        the most recent non-null prior entry is used instead of returning zeros."""
+        _GB_local = 1024**3
+        resources = [
+            {
+                "type": "node",
+                "id": "node/pve1",
+                "node": "pve1",
+                "status": "online",
+                "cpu": 0.10,
+                "maxcpu": 4,
+                "mem": 2 * _GB_local,
+                "maxmem": 8 * _GB_local,
+            },
+        ]
+        ceph = {
+            "health": {"status": "HEALTH_OK"},
+            "pgmap": {
+                "read_bytes_sec": 0,
+                "write_bytes_sec": 0,
+                "read_op_per_sec": 0,
+                "write_op_per_sec": 0,
+            },
+        }
+        # Last entry has null values — simulates in-progress consolidation period
+        rrd = [
+            {"netin": 1111.0, "netout": 2222.0, "loadavg": 1.5},
+            {"netin": None, "netout": None, "loadavg": None},
+        ]
+        responses = {
+            "/api2/json/cluster/resources": resources,
+            "/api2/json/cluster/ceph/status": ceph,
+            "/api2/json/nodes/pve1/rrddata": rrd,
+        }
+        server, port, _ = _start_server(responses)
+        try:
+            from claude_visualizer.monitors.proxmox_perf import Monitor
+
+            cfg = _write_yaml(tmp_path, _yaml_for_url(f"http://127.0.0.1:{port}"))
+            m = Monitor(config_path=cfg)
+            m.tick(0.0)
+            snap = m._in_flight.result(timeout=5.0)
+            assert snap is not None
+            assert snap.net_in_bps == pytest.approx(
+                1111.0, abs=0.1
+            ), "null last entry must not suppress prior valid netin"
+            assert snap.net_out_bps == pytest.approx(
+                2222.0, abs=0.1
+            ), "null last entry must not suppress prior valid netout"
+        finally:
+            server.shutdown()
+
 
 # ---------------------------------------------------------------------------
 # AC11 — Ceph endpoint absent → Ceph fields zero, no crash

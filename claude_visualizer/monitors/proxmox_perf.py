@@ -378,12 +378,18 @@ def _fetch_node_rrd(
             f"/api2/json/nodes/{node_name}/rrddata?timeframe=hour&cf=AVERAGE"
         )
         if rrd:
-            last = rrd[-1]
-            return (
-                float(last.get("netin", 0) or 0),
-                float(last.get("netout", 0) or 0),
-                float(last.get("loadavg", 0) or 0),
-            )
+            # rrd[-1] (current period) often has null values while
+            # Proxmox is still accumulating; scan backwards for the
+            # most recent entry with actual network data.
+            for entry in reversed(rrd):
+                net_in = entry.get("netin")
+                net_out = entry.get("netout")
+                if net_in is not None or net_out is not None:
+                    return (
+                        float(net_in or 0),
+                        float(net_out or 0),
+                        float(entry.get("loadavg") or 0),
+                    )
     except (
         ConnectionError,
         Timeout,
